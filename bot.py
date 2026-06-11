@@ -17,7 +17,7 @@ Bot Scalping v18.4.0 — DRY RUN LOG MODE (PAPER TRADING)
         Fee per trade  : ~$0.04 (2 × 0.05% × $40)
         Net TP (+0.5%) : $40 × 0.005 − $0.04 = +$0.16
         Net SL (−0.15%): $40 × 0.0015 + $0.04 = −$0.10
-        Expectancy @60%WR: 0.6×0.16 − 0.4×0.10 = +$0.056/trade ✅
+        Expectancy @60%WR: 0.6×0.16 − 0.4×0.10 = +$0.056/trade 
 
   LOGIKA BALIK (tidak berubah):
     Sinyal asli LONG  → Bot eksekusi SHORT
