@@ -1,36 +1,6 @@
 """
-Bot Scalping v18.6.0 — INVERSE FIXED (DRY RUN LOG MODE)
+Bot Scalping v19.0 — PURE INVERSE, NO TRAIL, FIXED TP/SL
 =========================================================
-ROOT CAUSE DARI DATA v18.5.1:
-  HardSL: 171/235 trade (73%) → harga bergerak MELAWAN sinyal bot 73% waktu
-  Artinya: sinyal TA asli bot = SALAH ARAH mayoritas waktu
-  Kesimpulan: INVERSE kembali, tapi dengan fix bug yang bikin v18.3 gagal
-
-KENAPA INVERSE v18.3 DULU GAGAL (WR 27%):
-  Bug 1: BR filter tidak dibalik → LONG minta br > 0.60 padahal entry SHORT
-  Bug 2: RSI OB/OS tidak dibalik → RSI overbought malah tambah skor SHORT
-  Bug 3: TrailSL worst-case < Net SL → expectancy negatif walau WR sama
-  Bug 4: ForceTimeoutLoss dihapus → posisi nyangkut lama
-
-FIX v18.6.0:
-  ✅ INVERSE_MODE = True → sinyal LONG dieksekusi SHORT, SHORT → LONG
-  ✅ BR filter DIBALIK: signal LONG (akan jadi SHORT) butuh br < 0.40
-     (seller dominan = konfirmasi harga memang mau turun)
-  ✅ BR filter DIBALIK: signal SHORT (akan jadi LONG) butuh br > 0.60
-     (buyer dominan = konfirmasi harga memang mau naik)
-  ✅ 15M konfirmasi DIBALIK searah eksekusi (bukan searah sinyal asli)
-  ✅ R:R = 3:1 → BE WR = 25% → actual WR 26% = profit tipis tapi positif
-     Net TP = $40 × 0.85% - $0.04 = +$0.30
-     Net SL = $40 × 0.15% + $0.04 = -$0.10
-  ✅ TRAIL_ACTIVATE turun ke 0.30% → profit tidak kabur sebelum trail aktif
-  ✅ TRAIL_DISTANCE = 0.08% → worst close @0.22% → net +$0.048 > 0 ✅
-
-KALKULASI EKSPEKTANSI (@ WR 26%):
-  Expectancy = (0.26 × +$0.30) + (0.74 × -$0.10)
-             = +$0.078 - $0.074
-             = +$0.004/trade ✅ (tipis positif)
-  @ WR 30%: +$0.019/trade
-  @ WR 35%: +$0.032/trade
 """
 
 import os, time, math, threading, queue
@@ -48,52 +18,19 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.6.0
-#  INVERSE = True: sinyal LONG → eksekusi SHORT, dan sebaliknya
-#  Karena data nyata: 73% sinyal asli bot = salah arah
+#  CONFIG PURE INVERSE & FIXED TP/SL
 # ═══════════════════════════════════════════════════════
-
-INVERSE_MODE   = True    # ← BALIK: sinyal TA asli = salah → kita masuk kebalikannya
-
 LEVERAGE       = 20
-ORDER_USDT     = 2.0
-MAX_POSITIONS  = 3
+ORDER_USDT     = 2.0  # Margin $2 per posisi
+MAX_POSITIONS  = 3    # Maksimal 3 posisi
 
-# ── TP / SL — R:R 3:1 supaya BE WR = 25% ───────────────
-#
-#  Data menunjukkan WR aktual ~26%, artinya kita butuh R:R
-#  minimal 3:1 supaya expectancy positif:
-#    BE WR = 1 / (1 + R:R) = 1 / (1 + 3) = 25%
-#    Actual 26% > 25% → profit $0.004/trade
-#
-#  Net TP (+0.85%): $40 × 0.0085 − $0.04 = +$0.30
-#  Net SL (−0.15%): $40 × 0.0015 + $0.04 = −$0.10
-#  R:R = 3.0:1
-# ──────────────────────────────────────────────────────
-EXTREME_PROFIT_PCT = 0.0085   # +0.85% Take Profit (R:R 3:1)
-HARD_SL_PCT        = 0.0015   # -0.15% Hard Stop Loss (sama dengan data nyata)
-
-# ── TRAILING STOP — aktif lebih cepat agar profit tidak kabur ──
-#  TRAIL_ACTIVATE = 0.30%  → trail aktif setelah profit 0.30%
-#  TRAIL_DISTANCE = 0.08%  → toleransi turun dari peak
-#  Worst close    = 0.30% - 0.08% = 0.22%
-#  Net trail min  = $40 × 0.0022 - $0.04 = +$0.048 > 0 ✅
-#  (Tidak minus, tidak rugi saat trail aktif)
-TRAIL_ACTIVATE  = 0.0030   # Aktifkan trailing setelah profit 0.30%
-TRAIL_DISTANCE  = 0.0008   # Tutup jika turun 0.08% dari peak
-
-FUTURES_FEE_PCT = 0.0005   # Fee Taker Binance 0.05%
+TP_PCT         = 0.002  # +0.2% Take Profit
+SL_PCT         = 0.002  # -0.2% Stop Loss
+FUTURES_FEE_PCT = 0.0005 # Fee Taker 0.05%
 
 MIN_BASE_VOL   = 25_000_000
-MIN_VR         = 1.5        # Volume harus kuat
-ADX_MIN        = 20         # Trend minimal (diturunkan karena kita sudah inverse)
-
-# ── BR Filter — DIBALIK sesuai INVERSE logic ────────────
-#  Sinyal LONG (akan dieksekusi SHORT): butuh seller dominan (br < 0.40)
-#  Sinyal SHORT (akan dieksekusi LONG): butuh buyer dominan (br > 0.60)
-#  Ini fix bug utama v18.3: BR tidak ikut dibalik
-BR_LONG_SIGNAL_MAX  = 0.40  # sinyal LONG (exec SHORT): seller harus dominan
-BR_SHORT_SIGNAL_MIN = 0.60  # sinyal SHORT (exec LONG): buyer harus dominan
+MIN_VR         = 1.5
+ADX_MIN        = 20
 
 SCAN_INTERVAL  = 1
 MONITOR_INT    = 0.25
@@ -101,9 +38,9 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 
-MIN_SCORE      = 60         # Diturunkan sedikit karena sinyal sudah dibalik logikanya
+MIN_SCORE      = 60
 MIN_GAP        = 12
-COOLDOWN_SEC   = 3
+COOLDOWN_SEC   = 900  # 15 Menit biar gak spam koin yang sama
 TTL_5M         = 5
 TTL_15M        = 30
 
@@ -139,8 +76,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "trail_sl": 0, "force": 0,
-    "hist": deque(maxlen=200), "start": time.time(),
+    "tp_hit": 0, "sl_hit": 0, "hist": deque(maxlen=200), "start": time.time(),
 }
 
 # ═══════════════════════════════════════════════════════
@@ -261,53 +197,19 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
-
-# ═══════════════════════════════════════════════════════
-#  KONFIRMASI 15M — DIBALIK sesuai arah EKSEKUSI
-#
-#  PENTING: konfirmasi 15M harus searah dengan EKSEKUSI,
-#  bukan searah dengan sinyal TA asli.
-#
-#  Contoh:
-#    Sinyal TA = LONG → eksekusi = SHORT (inverse)
-#    15M harus konfirmasi SHORT (harga di bawah EMA)
-#
-#  Ini fix bug v18.3: 15M confirm masih pakai arah sinyal asli
-# ═══════════════════════════════════════════════════════
 def confirm_15m(symbol, exec_direction):
-    """
-    Konfirmasi 15M searah dengan arah EKSEKUSI (sudah di-inverse).
-    exec_direction = arah yang akan dieksekusi bot (sudah dibalik).
-    """
     try:
         df15 = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_15MINUTE, 60).copy())
-        if df15 is None or len(df15) < 30:
-            return True  # allow jika data tidak ada
+        if df15 is None or len(df15) < 30: return True
         row = df15.iloc[-2]
         p, e9, e21, m5 = row["close"], row["e9"], row["e21"], row["m5"]
-        if exec_direction == "LONG":
-            # Eksekusi LONG → 15M harus bullish
-            return (p > e9 and p > e21) or m5 > 0.002
-        else:  # SHORT
-            # Eksekusi SHORT → 15M harus bearish
-            return (p < e9 and p < e21) or m5 < -0.002
+        if exec_direction == "LONG": return (p > e9 and p > e21) or m5 > 0.002
+        else: return (p < e9 and p < e21) or m5 < -0.002
     except:
         return True
 
-
 # ═══════════════════════════════════════════════════════
-#  SIGNAL — menghasilkan sinyal TA asli, lalu DIBALIK
-#
-#  Alur v18.6.0:
-#    1. Hitung sinyal TA asli (LONG / SHORT)
-#    2. BALIK: sinyal LONG → eksekusi SHORT, SHORT → eksekusi LONG
-#    3. BR filter: sesuaikan dengan arah EKSEKUSI (bukan sinyal)
-#    4. 15M: konfirmasi searah EKSEKUSI
-#
-#  FIX dari v18.3:
-#    - BR filter ikut dibalik
-#    - 15M confirm ikut dibalik
-#    - Skor RSI OB/OS tidak double-penalize setelah inverse
+#  SIGNAL — PURE INVERSE LOGIC
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -316,92 +218,56 @@ def signal(df, symbol=None):
     rsi, mh, mh_p, mh_p2 = row["rsi"], row["mh"], prev["mh"], prev2["mh"]
     vr, br, m5, body, atr, adx = row["vr"], row["br"], row["m5"], row["br2"], row["atr"], row["adx"]
 
-    # ── Filter volume & ADX: sama seperti sebelumnya ──
     if vr < MIN_VR: return None, 0, [], atr
     if adx < ADX_MIN: return None, 0, [], atr
 
     lp = sp = 0
     sl, ss = [], []
 
-    # ── EMA Stack — sinyal TA ASLI ─────────────────────
+    # Hitung normal dulu
     if p > e5 > e9 > e21 > e50:   lp += 35; sl.append("EMA_stack↑")
     elif p > e5 > e9 > e21:       lp += 25; sl.append("EMA↑↑")
     if p < e5 < e9 < e21 < e50:   sp += 35; ss.append("EMA_stack↓")
     elif p < e5 < e9 < e21:       sp += 25; ss.append("EMA↓↓")
 
-    # ── Momentum ───────────────────────────────────────
     if m5 > 0.005:    lp += 28; sl.append(f"Mom+{m5*100:.1f}%")
     elif m5 > 0.003:  lp += 20; sl.append(f"Mom+{m5*100:.1f}%")
     if m5 < -0.005:   sp += 28; ss.append(f"Mom{m5*100:.1f}%")
     elif m5 < -0.003: sp += 20; ss.append(f"Mom{m5*100:.1f}%")
 
-    # ── MACD ───────────────────────────────────────────
     if mh_p <= 0 and mh > 0:             lp += 25; sl.append("MACD_X↑")
     elif mh > 0 and mh > mh_p > mh_p2:   lp += 20; sl.append("MACD↑↑")
     if mh_p >= 0 and mh < 0:             sp += 25; ss.append("MACD_X↓")
     elif mh < 0 and mh < mh_p < mh_p2:   sp += 20; ss.append("MACD↓↓")
 
-    # ── Volume Ratio ───────────────────────────────────
     if vr >= 3.0:   lp += 15; sp += 15; sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
     elif vr >= 2.0: lp += 10; sp += 10; sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
 
-    # ── RSI Filter ─────────────────────────────────────
-    # CATATAN: RSI OB/OS tidak di-inverse karena dia filter kualitas
-    # (RSI overbought = LONG sinyal lemah = SHORT eksekusi lebih baik ✅)
     if rsi > 75:   lp = int(lp * 0.3); sp += 25; ss.append(f"RSI_OB{rsi:.0f}")
     elif rsi < 25: sp = int(sp * 0.3); lp += 25; sl.append(f"RSI_OS{rsi:.0f}")
 
-    # ── ADX bonus ──────────────────────────────────────
     if adx > 40:   lp += 12; sp += 12; sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
     elif adx > 30: lp += 7;  sp += 7
+
+    # ── SWAP LOGIC (PURE INVERSE) ──
+    # Langsung putar skornya disini. Sinyal jelek (loss) = eksekusi.
+    lp, sp = sp, lp
+    sl, ss = ss, sl
 
     btc    = _macro["btc"]
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
     thresh = 50 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
-    # ─────────────────────────────────────────────────────────────────
-    #  INVERSE LOGIC:
-    #  Sinyal TA asli LONG → eksekusi SHORT (dan sebaliknya)
-    #
-    #  BR filter DIBALIK:
-    #    Sinyal TA LONG (kita exec SHORT) → butuh SELLER dominan (br < 0.40)
-    #      Logika: kalau seller dominan, harga memang mau turun = SHORT benar
-    #    Sinyal TA SHORT (kita exec LONG) → butuh BUYER dominan (br > 0.60)
-    #      Logika: kalau buyer dominan, harga memang mau naik = LONG benar
-    #
-    #  15M konfirmasi DIBALIK: searah arah EKSEKUSI (bukan sinyal asli)
-    # ─────────────────────────────────────────────────────────────────
-
-    # Sinyal TA asli = LONG → kita eksekusi SHORT
     if lp > sp and lp >= thresh and gap >= MIN_GAP:
-        exec_dir = "SHORT"  # ← dibalik
-        # BR filter untuk eksekusi SHORT: seller harus dominan
-        if br > BR_LONG_SIGNAL_MAX:
-            # Buyer masih dominan → SHORT berisiko, skip
-            return None, lp, [], atr
-        # 15M harus konfirmasi SHORT (arah eksekusi)
-        if symbol and not confirm_15m(symbol, exec_dir):
-            return None, lp, [], atr
-        # Label sigs: tambahkan INV tag supaya jelas di log
-        inv_sigs = [f"INV({s})" for s in sl[:3]]
-        return exec_dir, lp, inv_sigs, atr
+        if symbol and not confirm_15m(symbol, "LONG"): return None, lp, [], atr
+        return "LONG", lp, [f"INV({s})" for s in sl[:3]], atr
 
-    # Sinyal TA asli = SHORT → kita eksekusi LONG
     if sp > lp and sp >= thresh and gap >= MIN_GAP:
-        exec_dir = "LONG"  # ← dibalik
-        # BR filter untuk eksekusi LONG: buyer harus dominan
-        if br < BR_SHORT_SIGNAL_MIN:
-            # Seller masih dominan → LONG berisiko, skip
-            return None, sp, [], atr
-        # 15M harus konfirmasi LONG (arah eksekusi)
-        if symbol and not confirm_15m(symbol, exec_dir):
-            return None, sp, [], atr
-        inv_sigs = [f"INV({s})" for s in ss[:3]]
-        return exec_dir, sp, inv_sigs, atr
+        if symbol and not confirm_15m(symbol, "SHORT"): return None, sp, [], atr
+        return "SHORT", sp, [f"INV({s})" for s in ss[:3]], atr
 
     return None, max(lp, sp), [], atr
-
 
 # ═══════════════════════════════════════════════════════
 #  DRY RUN OPEN / CLOSE
@@ -426,26 +292,14 @@ def live_open(sym, direction, score, sigs, price, atr):
         "qty":          q_val,
         "open_time":    time.time(),
         "score":        score,
-        "sigs":         sigs,
-        "atr":          atr,
-        "trail_active": False,
-        "peak_prof":    0.0,
+        "sigs":         sigs
     }
     with _lock: live_positions[sym] = pos
 
-    notional         = entry_price * q_val
-    net_tp           = notional * EXTREME_PROFIT_PCT   - notional * FUTURES_FEE_PCT * 2
-    net_sl           = notional * HARD_SL_PCT           + notional * FUTURES_FEE_PCT * 2
-    net_trail_worst  = notional * (TRAIL_ACTIVATE - TRAIL_DISTANCE) - notional * FUTURES_FEE_PCT * 2
-
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY RUN] {sym} {direction} @{entry_price:.6g}  [INVERSE ACTIVE]")
-    print(f"      TP:+{EXTREME_PROFIT_PCT*100:.2f}%(+${net_tp:.3f}) | "
-          f"SL:-{HARD_SL_PCT*100:.2f}%(-${net_sl:.3f}) | "
-          f"Trail@{TRAIL_ACTIVATE*100:.1f}% dist{TRAIL_DISTANCE*100:.2f}% "
-          f"worst+${net_trail_worst:.3f}")
+    print(f"\n  {d} [DRY RUN] {sym} {direction} @{entry_price:.6g}")
+    print(f"      TP:+{TP_PCT*100:.2f}% | SL:-{SL_PCT*100:.2f}%")
     _stats["trades"] += 1
-
 
 def live_close(sym, reason, price=None):
     with _lock:
@@ -466,8 +320,7 @@ def live_close(sym, reason, price=None):
     e    = "🟢" if pnl >= 0 else "🔴"
 
     print(f"  {e} [DRY RUN] {sym} {side} CLOSE — {reason}")
-    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | "
-          f"PnL Bersih:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Bersih:{pnl:+.5f}U")
 
     _stats["pnl"]  += pnl
     _stats["hist"].append(pnl)
@@ -480,9 +333,8 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
-    elif "HardSL"      in reason: _stats["hard_sl"]    += 1
-    elif "TrailSL"     in reason: _stats["trail_sl"]   += 1
+    if "TakeProfit" in reason: _stats["tp_hit"] += 1
+    elif "StopLoss" in reason: _stats["sl_hit"] += 1
 
     trade_log.append({
         "sym":    sym,
@@ -496,9 +348,8 @@ def live_close(sym, reason, price=None):
     set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
     print_inline()
 
-
 # ═══════════════════════════════════════════════════════
-#  MONITOR — trailing stop terkalibrasi
+#  MONITOR — STRICT TP & SL ONLY
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -510,43 +361,20 @@ def monitor_positions():
 
         side, entry = pos["side"], pos["entry"]
         hold        = time.time() - pos["open_time"]
+        prof_pct    = (px - entry) / entry if side == "LONG" else (entry - px) / entry
 
-        prof_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
-
-        # Update peak
-        if prof_pct > pos["peak_prof"]:
-            pos["peak_prof"] = prof_pct
-
-        # Aktifkan trailing
-        if not pos["trail_active"] and prof_pct >= TRAIL_ACTIVATE:
-            pos["trail_active"] = True
-            q_val   = pos["qty"]
-            net_now = prof_pct * entry * q_val - (entry * q_val + px * q_val) * FUTURES_FEE_PCT
-            print(f"   🔔 {sym} TRAIL AKTIF @{prof_pct*100:.2f}% net+${net_now:.4f} "
-                  f"— worst close@{(TRAIL_ACTIVATE-TRAIL_DISTANCE)*100:.2f}%")
-
-        # Cek trailing stop
-        if pos["trail_active"]:
-            drawdown = pos["peak_prof"] - prof_pct
-            if drawdown >= TRAIL_DISTANCE:
-                live_close(sym, f"TrailSL(peak:{pos['peak_prof']*100:.2f}%)", px)
-                continue
-
-        # Hard TP & SL
-        if prof_pct >= EXTREME_PROFIT_PCT:
-            live_close(sym, "ExtremeProfit", px); continue
-        if prof_pct <= -HARD_SL_PCT:
-            live_close(sym, "HardSL", px); continue
+        # Hard TP & SL murni
+        if prof_pct >= TP_PCT:
+            live_close(sym, "TakeProfit", px); continue
+        if prof_pct <= -SL_PCT:
+            live_close(sym, "StopLoss", px); continue
 
         # Status print
         q_val   = pos["qty"]
         fee_est = (entry * q_val + px * q_val) * FUTURES_FEE_PCT
         pnl_now = prof_pct * entry * q_val - fee_est
-        trail_s = f" TRAIL@peak{pos['peak_prof']*100:.2f}%" if pos["trail_active"] else ""
         arrow   = "L" if side == "LONG" else "S"
-        print(f"   📌 {sym} {arrow}@{entry:.5g}→{px:.5g}"
-              f"({prof_pct*100:+.2f}%){trail_s} {pnl_now:+.4f}U {hold:.0f}s [DRY]")
-
+        print(f"   📌 {sym} {arrow}@{entry:.5g}→{px:.5g} ({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
 # ═══════════════════════════════════════════════════════
 #  SCANNER & THREAD ENGINE
@@ -568,7 +396,6 @@ def scan_one(sym):
         return (sym, dir_, sc, sigs, px_live, atr_val)
     except: return None
 
-
 def scan_batch(syms):
     res = []
     fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
@@ -577,7 +404,6 @@ def scan_batch(syms):
             if r := f.result(timeout=2): res.append(r)
     except: pass
     return res
-
 
 def top_movers(syms, n=20):
     tk, ss = tickers_all(), set(syms)
@@ -588,20 +414,12 @@ def top_movers(syms, n=20):
     ]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
-
 def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    notional_avg = ORDER_USDT * LEVERAGE
-    net_tp_est   = notional_avg * EXTREME_PROFIT_PCT - notional_avg * FUTURES_FEE_PCT * 2
-    net_sl_est   = notional_avg * HARD_SL_PCT        + notional_avg * FUTURES_FEE_PCT * 2
-    rr           = net_tp_est / net_sl_est
-    print(f"      ┌ [v18.6.0 INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} "
-          f"{e}PnL:{pnl:+.4f}U R:R={rr:.1f}:1")
-    print(f"      └ ExTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} "
-          f"HardSL:{_stats['hard_sl']} | Trail@{TRAIL_ACTIVATE*100:.1f}%")
-
+    print(f"      ┌ [v19.0 INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"      └ TP:{_stats['tp_hit']} SL:{_stats['sl_hit']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -610,16 +428,6 @@ def print_full():
     sess = (time.time() - _stats["start"]) / 3600
     tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
-
-    notional = ORDER_USDT * LEVERAGE
-    net_tp   = notional * EXTREME_PROFIT_PCT - notional * FUTURES_FEE_PCT * 2
-    net_sl   = notional * HARD_SL_PCT        + notional * FUTURES_FEE_PCT * 2
-    net_tr   = notional * (TRAIL_ACTIVATE - TRAIL_DISTANCE) - notional * FUTURES_FEE_PCT * 2
-    rr       = net_tp / net_sl
-    be_wr    = 1 / (1 + rr) * 100
-
-    # Expectancy aktual
-    exp_act  = (wr/100) * net_tp + ((100-wr)/100) * (-net_sl) if n > 0 else 0
 
     sh = md = 0.0
     if len(_stats["hist"]) >= 5:
@@ -631,26 +439,17 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*66}")
-    print(f"   ✅ DRY RUN v18.6.0 [INVERSE FIXED] — {sess*60:.0f}m | {tph:.1f}T/jam")
-    print(f"   💡 Cara loss dibalik: sinyal TA salah arah → entry kebalikannya")
-    print(f"   🔧 Fix v18.3: BR+15M searah eksekusi, bukan searah sinyal asli")
-    print(f"   📐 Net TP:+${net_tp:.3f} | Net SL:-${net_sl:.3f} | "
-          f"Trail worst:+${net_tr:.3f} | R:R={rr:.1f} | BE WR={be_wr:.0f}%")
+    print(f"   ✅ DRY RUN v19.0 [PURE INVERSE] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"   💰 Expectancy aktual: {exp_act:+.4f}U/trade (target >0)")
     print(f"   📊 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
-    print(f"   🔔 ExtremeTP:{_stats['extreme_tp']} TrailSL:{_stats['trail_sl']} "
-          f"HardSL:{_stats['hard_sl']}")
-    print(f"   KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    print(f"   🔔 TP Hit:{_stats['tp_hit']} SL Hit:{_stats['sl_hit']}")
     if trade_log:
         print(f"   📋 Last 5 trade:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
-            print(f"      {em} {t['sym']:<14} {t['side']} "
-                  f"{t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+            print(f"      {em} {t['sym']:<14} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*66}")
-
 
 # ═══════════════════════════════════════════════════════
 #  DAEMON THREADS
@@ -661,7 +460,6 @@ def t_monitor():
             if live_positions: monitor_positions()
         except: pass
         time.sleep(MONITOR_INT)
-
 
 def t_rescan(syms):
     while True:
@@ -680,7 +478,6 @@ def t_rescan(syms):
                     live_open(sym, d, sc, sg, px, atr)
         except: pass
 
-
 def t_macro():
     while True:
         try: _macro["btc"] = btc_trend()
@@ -694,33 +491,15 @@ def t_macro():
         except: pass
         time.sleep(5)
 
-
 # ═══════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════
 def run_bot():
-    notional = ORDER_USDT * LEVERAGE
-    net_tp   = notional * EXTREME_PROFIT_PCT - notional * FUTURES_FEE_PCT * 2
-    net_sl   = notional * HARD_SL_PCT        + notional * FUTURES_FEE_PCT * 2
-    net_tr   = notional * (TRAIL_ACTIVATE - TRAIL_DISTANCE) - notional * FUTURES_FEE_PCT * 2
-    rr       = net_tp / net_sl
-    be_wr    = 1 / (1 + rr) * 100
-
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v18.6.0 — INVERSE FIXED                            ║")
-    print("║  💡 Cara bot loss = cara bot entry sekarang:                   ║")
-    print("║     Sinyal TA = LONG  → eksekusi SHORT (harga turun 73%)      ║")
-    print("║     Sinyal TA = SHORT → eksekusi LONG  (harga naik 73%)       ║")
-    print("║  🔧 Fix v18.3: BR + 15M konfirmasi ikut dibalik               ║")
-    print("║  ⚠️  NO REAL ORDERS — SIMULATION LOGGING ONLY                  ║")
+    print("║  ✅ DRY RUN v19.0 — PURE INVERSE & FIXED 0.2% TP/SL              ║")
+    print("║  💡 Logika Entry Dibalik 100% dari akar (Sinyal Jelek = Masuk)   ║")
+    print("║  ⚠️ NO TRAILING STOP | NO TIMEOUT | MAX 3 POSISI                 ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
-    print(f"   Net TP:+${net_tp:.3f} | Net SL:-${net_sl:.3f} | "
-          f"Trail worst:+${net_tr:.3f} | R:R={rr:.1f}:1")
-    print(f"   BE WR: ~{be_wr:.0f}% | "
-          f"Trail aktif @{TRAIL_ACTIVATE*100:.1f}%, "
-          f"worst nutup @{(TRAIL_ACTIVATE-TRAIL_DISTANCE)*100:.2f}%")
-    print(f"   Score≥{MIN_SCORE} | VR≥{MIN_VR}x | ADX≥{ADX_MIN} | "
-          f"BR filter DIBALIK sesuai arah eksekusi")
 
     try:
         valid = {
@@ -732,9 +511,9 @@ def run_bot():
     except:
         syms = list(dict.fromkeys(SYMBOLS))
 
-    threading.Thread(target=t_monitor,             daemon=True).start()
+    threading.Thread(target=t_monitor,       daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,               daemon=True).start()
+    threading.Thread(target=t_macro,         daemon=True).start()
 
     time.sleep(4); tickers_all()
     cycle    = scan_idx = 0
@@ -783,7 +562,6 @@ def run_bot():
 
         if cycle % 20 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     run_bot()
