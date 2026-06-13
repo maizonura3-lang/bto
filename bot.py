@@ -1,5 +1,5 @@
 """
-Bot Scalping v19.5 — INVERSE MODE (SPAM ENTRY / AGGRESSIVE)
+Bot Scalping v19.6 — NORMAL MODE (SPAM ENTRY / AGGRESSIVE)
 =========================================================
 """
 
@@ -18,7 +18,7 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG INVERSE & FIXED TP/SL (AGRESIF)
+#  CONFIG NORMAL & FIXED TP/SL (AGRESIF)
 # ═══════════════════════════════════════════════════════
 LEVERAGE       = 20
 ORDER_USDT     = 2.0  # Margin $2 per posisi
@@ -30,8 +30,8 @@ FUTURES_FEE_PCT = 0.0005 # Fee Taker 0.05% per transaksi (Total 0.1%)
 
 # Syarat dilonggarkan biar sering entry
 MIN_BASE_VOL   = 20_000_000
-MIN_VR         = 1.0    # Turun dari 1.5
-ADX_MIN        = 15     # Turun dari 20
+MIN_VR         = 1.0    
+ADX_MIN        = 15     
 
 SCAN_INTERVAL  = 1
 MONITOR_INT    = 0.25
@@ -39,8 +39,8 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 
-MIN_SCORE      = 45     # Turun dari 60
-MIN_GAP        = 8      # Turun dari 12
+MIN_SCORE      = 45     
+MIN_GAP        = 8      
 COOLDOWN_SEC   = 180    # Cuma 3 menit nunggu abis close posisi
 TTL_5M         = 5
 
@@ -199,7 +199,7 @@ def ks_upd(pnl):
 
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL — PURE INVERSE LOGIC (NO 15M CONFIRMATION)
+#  SIGNAL — NORMAL LOGIC (KEMBALI KE ARAH ASLI)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -239,21 +239,17 @@ def signal(df, symbol=None):
     if adx > 40:   lp += 12; sp += 12; sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
     elif adx > 30: lp += 7;  sp += 7
 
-    # ── INVERSE LOGIC (DIBALIK 180 DERAJAT) ──
-    lp, sp = sp, lp
-    sl, ss = ss, sl
-
     btc    = _macro["btc"]
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
     thresh = 40 if btc_sw else MIN_SCORE  # Pas sideways lebih gampang entry
     gap    = abs(lp - sp)
 
-    # TANPA FILTER 15 MENIT BIAR SPAM ENTRY
+    # ── EKSEKUSI NORMAL (Tidak Dibalik) ──
     if lp > sp and lp >= thresh and gap >= MIN_GAP:
-        return "LONG", lp, [f"INV({s})" for s in sl[:3]], atr
+        return "LONG", lp, sl[:3], atr
 
     if sp > lp and sp >= thresh and gap >= MIN_GAP:
-        return "SHORT", sp, [f"INV({s})" for s in ss[:3]], atr
+        return "SHORT", sp, ss[:3], atr
 
     return None, max(lp, sp), [], atr
 
@@ -407,7 +403,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"      ┌ [v19.5 SPAM INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"      ┌ [v19.6 SPAM NORMAL] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"      └ TP:{_stats['tp_hit']} SL:{_stats['sl_hit']}")
 
 def print_full():
@@ -428,7 +424,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*66}")
-    print(f"   ✅ DRY RUN v19.5 [AGRESIF INVERSE] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"   ✅ DRY RUN v19.6 [AGRESIF NORMAL] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"   📊 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -485,8 +481,8 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.5 — INVERSE AGRESIF (SPAM ENTRY)                 ║")
-    print("║  💡 Konfirmasi 15M Dihapus. Syarat Score Diturunkan.             ║")
+    print("║  ✅ DRY RUN v19.6 — NORMAL AGRESIF (SPAM ENTRY)                  ║")
+    print("║  💡 Logika Dikembalikan: Sinyal Asli (LONG -> LONG, SHORT -> SHORT)║")
     print("║  ⚠️ TP 0.5% | SL 0.2% | MAX 3 POSISI                             ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
