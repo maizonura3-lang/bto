@@ -1,5 +1,5 @@
 """
-Bot Scalping v19.1 — NORMAL MODE, FIXED TP 0.3% / SL 0.1%
+Bot Scalping v19.4 — INVERSE MODE, FIXED TP 0.5% / SL 0.2%
 =========================================================
 """
 
@@ -18,14 +18,14 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG NORMAL & FIXED TP/SL (Net 1:1)
+#  CONFIG INVERSE & FIXED TP/SL
 # ═══════════════════════════════════════════════════════
 LEVERAGE       = 20
 ORDER_USDT     = 2.0  # Margin $2 per posisi
 MAX_POSITIONS  = 3    # Maksimal 3 posisi
 
-TP_PCT         = 0.003  # +0.3% Take Profit (Kotor) -> Net Profit ~0.2%
-SL_PCT         = 0.001  # -0.1% Stop Loss (Kotor) -> Net Loss ~0.2%
+TP_PCT         = 0.005  # +0.5% Take Profit (Kotor)
+SL_PCT         = 0.002  # -0.2% Stop Loss (Kotor)
 FUTURES_FEE_PCT = 0.0005 # Fee Taker 0.05% per transaksi (Total 0.1%)
 
 MIN_BASE_VOL   = 25_000_000
@@ -209,7 +209,7 @@ def confirm_15m(symbol, exec_direction):
         return True
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL — NORMAL LOGIC
+#  SIGNAL — PURE INVERSE LOGIC
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -249,19 +249,23 @@ def signal(df, symbol=None):
     if adx > 40:   lp += 12; sp += 12; sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
     elif adx > 30: lp += 7;  sp += 7
 
+    # ── INVERSE LOGIC (DIBALIK 180 DERAJAT) ──
+    # Sinyal Long jadi Short, Sinyal Short jadi Long
+    lp, sp = sp, lp
+    sl, ss = ss, sl
+
     btc    = _macro["btc"]
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
     thresh = 50 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
-    # Eksekusi NORMAL (Tidak di-reverse)
     if lp > sp and lp >= thresh and gap >= MIN_GAP:
         if symbol and not confirm_15m(symbol, "LONG"): return None, lp, [], atr
-        return "LONG", lp, sl[:3], atr
+        return "LONG", lp, [f"INV({s})" for s in sl[:3]], atr
 
     if sp > lp and sp >= thresh and gap >= MIN_GAP:
         if symbol and not confirm_15m(symbol, "SHORT"): return None, sp, [], atr
-        return "SHORT", sp, ss[:3], atr
+        return "SHORT", sp, [f"INV({s})" for s in ss[:3]], atr
 
     return None, max(lp, sp), [], atr
 
@@ -316,7 +320,8 @@ def live_close(sym, reason, price=None):
     e    = "🟢" if pnl >= 0 else "🔴"
 
     print(f"  {e} [DRY RUN] {sym} {side} CLOSE — {reason}")
-    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Bersih:{pnl:+.5f}U")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s")
+    print(f"     PnL Net:{pnl:+.5f}U  [Kotor:{gross_pnl:+.5f}U | Fee:{total_fee:.5f}U]")
 
     _stats["pnl"]  += pnl
     _stats["hist"].append(pnl)
@@ -414,7 +419,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"      ┌ [v19.1 NORMAL] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"      ┌ [v19.4 INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"      └ TP:{_stats['tp_hit']} SL:{_stats['sl_hit']}")
 
 def print_full():
@@ -435,7 +440,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*66}")
-    print(f"   ✅ DRY RUN v19.1 [NORMAL] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"   ✅ DRY RUN v19.4 [INVERSE] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"   📊 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -492,9 +497,9 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.1 — NORMAL MODE & FIXED TP/SL (Net 1:1)          ║")
-    print("║  💡 Reverse/Inverse Dihapus. Kembali ke sinyal aslinya.          ║")
-    print("║  ⚠️ TP 0.3% | SL 0.1% | MAX 3 POSISI                             ║")
+    print("║  ✅ DRY RUN v19.4 — INVERSE MODE & FIXED TP/SL                   ║")
+    print("║  💡 Logika Terbalik: Sinyal LONG -> SHORT, Sinyal SHORT -> LONG  ║")
+    print("║  ⚠️ TP 0.5% | SL 0.2% | MAX 3 POSISI                             ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
     try:
