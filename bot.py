@@ -1,5 +1,5 @@
 """
-Bot Scalping v19.4 — INVERSE MODE, FIXED TP 0.5% / SL 0.2%
+Bot Scalping v19.5 — INVERSE MODE (SPAM ENTRY / AGGRESSIVE)
 =========================================================
 """
 
@@ -18,7 +18,7 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG INVERSE & FIXED TP/SL
+#  CONFIG INVERSE & FIXED TP/SL (AGRESIF)
 # ═══════════════════════════════════════════════════════
 LEVERAGE       = 20
 ORDER_USDT     = 2.0  # Margin $2 per posisi
@@ -28,9 +28,10 @@ TP_PCT         = 0.005  # +0.5% Take Profit (Kotor)
 SL_PCT         = 0.002  # -0.2% Stop Loss (Kotor)
 FUTURES_FEE_PCT = 0.0005 # Fee Taker 0.05% per transaksi (Total 0.1%)
 
-MIN_BASE_VOL   = 25_000_000
-MIN_VR         = 1.5
-ADX_MIN        = 20
+# Syarat dilonggarkan biar sering entry
+MIN_BASE_VOL   = 20_000_000
+MIN_VR         = 1.0    # Turun dari 1.5
+ADX_MIN        = 15     # Turun dari 20
 
 SCAN_INTERVAL  = 1
 MONITOR_INT    = 0.25
@@ -38,14 +39,13 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 
-MIN_SCORE      = 60
-MIN_GAP        = 12
-COOLDOWN_SEC   = 900  # 15 Menit biar gak spam koin yang sama
+MIN_SCORE      = 45     # Turun dari 60
+MIN_GAP        = 8      # Turun dari 12
+COOLDOWN_SEC   = 180    # Cuma 3 menit nunggu abis close posisi
 TTL_5M         = 5
-TTL_15M        = 30
 
 DAILY_LOSS     = -8.0
-CONSEC_MAX     = 6
+CONSEC_MAX     = 8      # Boleh loss 8x beruntun sebelum pause
 CONSEC_PAUSE   = 60
 
 # ═══════════════════════════════════════════════════════
@@ -127,7 +127,7 @@ def set_cd(sym): _sym_cooldown[sym] = time.time()
 
 def ohlcv(symbol, interval, limit=100):
     key, now = (symbol, interval), time.time()
-    ttl = TTL_5M if interval == Client.KLINE_INTERVAL_5MINUTE else TTL_15M
+    ttl = TTL_5M
     if key in _ohlcv_cache and now - _ohlcv_cache[key][0] < ttl:
         return _ohlcv_cache[key][1]
     try:
@@ -197,19 +197,9 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
-def confirm_15m(symbol, exec_direction):
-    try:
-        df15 = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_15MINUTE, 60).copy())
-        if df15 is None or len(df15) < 30: return True
-        row = df15.iloc[-2]
-        p, e9, e21, m5 = row["close"], row["e9"], row["e21"], row["m5"]
-        if exec_direction == "LONG": return (p > e9 and p > e21) or m5 > 0.002
-        else: return (p < e9 and p < e21) or m5 < -0.002
-    except:
-        return True
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL — PURE INVERSE LOGIC
+#  SIGNAL — PURE INVERSE LOGIC (NO 15M CONFIRMATION)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -250,21 +240,19 @@ def signal(df, symbol=None):
     elif adx > 30: lp += 7;  sp += 7
 
     # ── INVERSE LOGIC (DIBALIK 180 DERAJAT) ──
-    # Sinyal Long jadi Short, Sinyal Short jadi Long
     lp, sp = sp, lp
     sl, ss = ss, sl
 
     btc    = _macro["btc"]
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
-    thresh = 50 if btc_sw else MIN_SCORE
+    thresh = 40 if btc_sw else MIN_SCORE  # Pas sideways lebih gampang entry
     gap    = abs(lp - sp)
 
+    # TANPA FILTER 15 MENIT BIAR SPAM ENTRY
     if lp > sp and lp >= thresh and gap >= MIN_GAP:
-        if symbol and not confirm_15m(symbol, "LONG"): return None, lp, [], atr
         return "LONG", lp, [f"INV({s})" for s in sl[:3]], atr
 
     if sp > lp and sp >= thresh and gap >= MIN_GAP:
-        if symbol and not confirm_15m(symbol, "SHORT"): return None, sp, [], atr
         return "SHORT", sp, [f"INV({s})" for s in ss[:3]], atr
 
     return None, max(lp, sp), [], atr
@@ -419,7 +407,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"      ┌ [v19.4 INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"      ┌ [v19.5 SPAM INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"      └ TP:{_stats['tp_hit']} SL:{_stats['sl_hit']}")
 
 def print_full():
@@ -440,7 +428,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*66}")
-    print(f"   ✅ DRY RUN v19.4 [INVERSE] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"   ✅ DRY RUN v19.5 [AGRESIF INVERSE] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"   📊 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -497,8 +485,8 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.4 — INVERSE MODE & FIXED TP/SL                   ║")
-    print("║  💡 Logika Terbalik: Sinyal LONG -> SHORT, Sinyal SHORT -> LONG  ║")
+    print("║  ✅ DRY RUN v19.5 — INVERSE AGRESIF (SPAM ENTRY)                 ║")
+    print("║  💡 Konfirmasi 15M Dihapus. Syarat Score Diturunkan.             ║")
     print("║  ⚠️ TP 0.5% | SL 0.2% | MAX 3 POSISI                             ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
