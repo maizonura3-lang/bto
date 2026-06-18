@@ -45,9 +45,14 @@ MAX_POSITIONS = 3
 # Risk Management (Akan ditukar di RiskManager)
 ATR_MULT_SL = 1.2      # Awalnya SL, sekarang dipakai untuk TP
 ATR_MULT_TP = 2.5      # Awalnya TP, sekarang dipakai untuk SL
-MIN_RR_RATIO = 1.8     # (Sudah tidak dipaksa lagi karena reverse logic)
-MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar)
+MIN_RR_RATIO = 1.8     
+MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar jadi batas TP maksimal)
 MAX_TP_PCT = 0.004     # Maksimum TP persen (Ditukar -> Ini adalah HardSL 0.4%)
+
+# Trailing Stop Management (BARU)
+TRAIL_ACTIVATE_PCT = 0.0025   # Profit 0.25% baru trailing aktif (biar nafas dulu)
+TRAIL_CALLBACK_PCT = 0.0010   # Jarak trailing 0.10% dari pucuk profit
+TRAIL_MIN_FLOOR = 0.0015      # Batas bawah mutlak (Fee 0.1% + Bersih 0.05%)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -69,7 +74,7 @@ SCAN_INTERVAL = 2.0
 MONITOR_INT = 1.0
 BATCH_SIZE = 15
 MAX_WORKERS = 5
-SLOT_FILL_INT = 3.0    # Diperbaiki agar tidak nge-DDOS Binance API
+SLOT_FILL_INT = 3.0
 
 # Scoring & Filter
 MIN_SCORE = 55
@@ -588,16 +593,13 @@ class SignalScorer:
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, atr: float, direction: str) -> Tuple[float, float, float, float]:
-        # 1. TUKAR MULTIPLIER
         sl_distance = ATR_MULT_TP * atr  
         tp_distance = ATR_MULT_SL * atr  
 
-        # 2. SET MINIMAL TP 0.15% 
         min_tp_distance = entry_price * 0.0015
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
-        # 3. Batasi maksimum persen 
         max_sl = entry_price * MAX_TP_PCT
         max_tp = entry_price * MAX_SL_PCT
 
@@ -829,9 +831,6 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     
     sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, atr, direction)
     
-    # -------------------------------------------------------------------
-    # EKSEKUSI API BINANCE: OPEN POSISI
-    # -------------------------------------------------------------------
     binance_side = "BUY" if direction == "LONG" else "SELL"
     try:
         client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
@@ -845,7 +844,6 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
         print(f"\n  ❌ [API ERROR] Gagal open posisi {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
         return
-    # -------------------------------------------------------------------
 
     pos = {
         "side": direction, "entry": price, "qty": q_val,
@@ -871,9 +869,6 @@ def live_close(sym, reason, price=None):
     
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     
-    # -------------------------------------------------------------------
-    # EKSEKUSI API BINANCE: CLOSE POSISI
-    # -------------------------------------------------------------------
     binance_close_side = "SELL" if side == "LONG" else "BUY"
     try:
         client.futures_create_order(
@@ -884,7 +879,6 @@ def live_close(sym, reason, price=None):
         )
     except Exception as e:
         print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}")
-    # -------------------------------------------------------------------
 
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
@@ -929,7 +923,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MONITOR POSITIONS (WITH STRICT TRAILING TAKE PROFIT)
+#  MONITOR POSITIONS (DYNAMIC TRAILING TAKE PROFIT)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def monitor_positions():
@@ -958,14 +952,20 @@ def monitor_positions():
             pos["max_pnl_pct"] = pnl_pct
             
         # 3. ==========================================
-        #    LOGIKA TRAILING STRICT (HANYA BUAT PROFIT)
+        #    LOGIKA DYNAMIC TRAILING TAKE PROFIT
         #    ==========================================
-        # Wajib nyentuh angka > 0.15% (contoh: 0.16%) baru Trailing Aktif!
-        if pos["max_pnl_pct"] > 0.0015:
+        # Wajib nyentuh batas Aktif dulu (0.25%) biar bisa nafas!
+        if pos["max_pnl_pct"] >= TRAIL_ACTIVATE_PCT:
             
-            # Kalau harga berbalik arah dan turun nyentuh atau lebih kecil dari 0.15%
-            # LANGSUNG EKSEKUSI CUT PROFIT!
-            if pnl_pct <= 0.0015:
+            # Titik cut dinamis = pucuk tertinggi dikurangi callback (0.10%)
+            # Jadi makin pucuknya terbang, titik cut ini otomatis ikut narik ke atas
+            dynamic_limit = pos["max_pnl_pct"] - TRAIL_CALLBACK_PCT
+            
+            # Pastikan titik cut tidak pernah lebih rendah dari minimal profit (0.15%)
+            trailing_limit = max(TRAIL_MIN_FLOOR, dynamic_limit)
+            
+            # Kalau harga turun nyentuh garis trailing, EKSEKUSI!
+            if pnl_pct <= trailing_limit:
                 live_close(sym, "TrailingTP", px)
                 continue
 
@@ -1005,16 +1005,12 @@ def scan_one(sym):
         direction, score, sigs, atr_val, _, _, regime, bias = scorer.get_signal(df_ta, sym)
         if direction is None: return None
 
-        # -------------------------------------------------------------
-        # REVERSE LOGIC: Membalik arah entry agar loss jadi profit
-        # -------------------------------------------------------------
         if direction == "LONG":
             direction = "SHORT"
             sigs = ["REV_SHORT"] + sigs 
         elif direction == "SHORT":
             direction = "LONG"
             sigs = ["REV_LONG"] + sigs   
-        # -------------------------------------------------------------
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1079,7 +1075,7 @@ def print_full():
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  TP/SL: REVERSED (TP 0.15% Min) | STRICT TRAILING")
+    print(f"    ⚙️  TP/SL: REVERSED (TP 0.15% Min) | DYNAMIC TRAILING")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -1163,7 +1159,7 @@ def t_macro():
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  ✅ LIVE TESTNET v20.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
-    print("║  ✅ REVERSED LOGIC + STRICT TRAILING TP 0.15% + HARDSL 0.4%        ║")
+    print("║  ✅ REVERSED LOGIC + DYNAMIC TRAILING TP + HARDSL 0.4%             ║")
     print("║  ✅ Self-Learning Signal Weights & Adaptive Scanning               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
