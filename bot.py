@@ -47,7 +47,7 @@ ATR_MULT_SL = 1.2      # Awalnya SL, sekarang dipakai untuk TP
 ATR_MULT_TP = 2.5      # Awalnya TP, sekarang dipakai untuk SL
 MIN_RR_RATIO = 1.8     # (Sudah tidak dipaksa lagi karena reverse logic)
 MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar)
-MAX_TP_PCT = 0.04      # Maksimum TP persen (akan ditukar)
+MAX_TP_PCT = 0.004      # Maksimum TP persen (akan ditukar)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -69,7 +69,7 @@ SCAN_INTERVAL = 2.0
 MONITOR_INT = 1.0
 BATCH_SIZE = 15
 MAX_WORKERS = 5
-SLOT_FILL_INT = 0.01
+SLOT_FILL_INT = 3.0
 
 # Scoring & Filter
 MIN_SCORE = 55
