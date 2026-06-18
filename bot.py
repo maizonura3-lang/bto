@@ -814,6 +814,10 @@ learning = LearningLayer(signal_weights)
 #  CORE TRADING FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CORE TRADING FUNCTIONS (API TESTNET ENABLED)
+# ═══════════════════════════════════════════════════════════════════════════
+
 def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
@@ -836,6 +840,28 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     
     sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, atr, direction)
     
+    # -------------------------------------------------------------------
+    # EKSEKUSI API BINANCE: OPEN POSISI
+    # Binance pakai istilah BUY/SELL, bukan LONG/SHORT
+    # -------------------------------------------------------------------
+    binance_side = "BUY" if direction == "LONG" else "SELL"
+    try:
+        # Set leverage dulu ke koinnya biar gak error
+        client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+        
+        # Eksekusi Market Order ke Testnet!
+        client.futures_create_order(
+            symbol=sym,
+            side=binance_side,
+            type='MARKET',
+            quantity=q_val
+        )
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal open posisi {sym}: {e}")
+        with _lock: live_positions.pop(sym, None)
+        return # Batal catat ke sistem kalau order gagal
+    # -------------------------------------------------------------------
+
     pos = {
         "side": direction, "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
@@ -846,7 +872,7 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% | RR:{tp_pct/sl_pct:.2f} | Regime:{regime}")
+    print(f"\n  {d} [LIVE TESTNET] {sym} {direction} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% | RR:{tp_pct/sl_pct:.2f} | Regime:{regime}")
     print(f"        Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
@@ -859,6 +885,25 @@ def live_close(sym, reason, price=None):
     if price == 0: return
     
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
+    
+    # -------------------------------------------------------------------
+    # EKSEKUSI API BINANCE: CLOSE POSISI
+    # Kebalikan arah: Kalau LONG maka tutup dengan SELL, dst.
+    # -------------------------------------------------------------------
+    binance_close_side = "SELL" if side == "LONG" else "BUY"
+    try:
+        # Lempar Market Order ke Testnet untuk nutup posisi
+        client.futures_create_order(
+            symbol=sym,
+            side=binance_close_side,
+            type='MARKET',
+            quantity=q_val
+        )
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}")
+        # Tetap lanjut proses log lokal di bawah supaya posisi keriset
+    # -------------------------------------------------------------------
+
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
     total_fee = (entry * q_val + price * q_val) * fee_rate
@@ -868,7 +913,7 @@ def live_close(sym, reason, price=None):
     won = pnl >= 0
     e = "🟢" if won else "🔴"
     
-    print(f"  {e} [DRY] {sym} {side} CLOSE — {reason}")
+    print(f"  {e} [LIVE TESTNET] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
     
     trade = TradeRecord(
@@ -900,7 +945,6 @@ def live_close(sym, reason, price=None):
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  MONITOR POSITIONS (WITH TRAILING TAKE PROFIT)
 # ═══════════════════════════════════════════════════════════════════════════
