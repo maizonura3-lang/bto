@@ -1,17 +1,29 @@
 """
-Bot Scalping v20.1.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)
+Bot Scalping v20.2.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE
 =============================================================
-PERUBAHAN dari v20.0.0:
-- FIX KRITIS: RR Ratio diperbaiki dari ~0.48 (rugi) menjadi ~1.8 (profit)
-- SL lebih ketat: 1.0x ATR (dari 2.5x) — potong cepat kalau arah salah
-- TP lebih lebar: 1.8x ATR (dari 1.2x) — biar win lebih besar dari loss
-- HardSL cap diturunkan: 0.25% (dari 0.4%) — lindungi modal lebih baik
-- TP cap dinaikkan: 1.0% (dari 1.5%) — realistis untuk scalping
-- Trailing aktif di 0.35% (dari 0.25%) — beri napas lebih ke posisi
-- Trailing callback 0.15% (dari 0.10%) — tidak terlalu ketat
-- Trailing floor 0.20% (dari 0.15%) — lock profit lebih baik + cover fee
-
-Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
+PERUBAHAN dari v20.1.0:
+- ENTRY DIBALIK LAGI ke arah ORIGINAL (non-reversed): sinyal LONG → eksekusi LONG,
+  sinyal SHORT → eksekusi SHORT.
+  CATATAN JUJUR: ini balik ke arah versi sebelum v20.0. Belum ada analisis data
+  yang membuktikan arah mana yang punya edge — keputusan ini diambil tanpa
+  backtest pembanding. Pantau WR & PnL beberapa ratus trade lagi sebelum
+  disimpulkan beneran lebih baik atau enggak.
+- SL/TP sekarang dipasang LANGSUNG di exchange (STOP_MARKET + TAKE_PROFIT_MARKET,
+  closePosition=True, workingType=MARK_PRICE) saat posisi dibuka — bukan cuma
+  dipantau lewat polling loop Python tiap 1 detik. Ini menghilangkan risiko
+  slippage eksekusi waktu market gerak cepat antara harga "kepantau lewat SL/TP"
+  dan order MARKET manual terkirim (kemungkinan besar penyebab Worst trade di
+  v20.1 jauh lebih jelek dari cap yang didesain).
+- Safety net: kalau order SL gagal terpasang di exchange, posisi langsung
+  force-close — tidak boleh ada posisi yang nganggur tanpa proteksi SL.
+- monitor_positions() sekarang ngecek status posisi di exchange (positionAmt==0)
+  untuk tahu kapan SL/TP exchange-side ke-fill, lalu update bookkeeping lokal +
+  cancel order pasangannya yang masih nganggur.
+- Trailing TP (logic & angka) TIDAK berubah — tetap aktif di 0.35%, callback
+  0.15%, floor 0.20%. Saat trigger, posisi ditutup manual via MARKET
+  (reduceOnly) setelah cancel dulu order SL/TP exchange-side yang masih nempel.
+- Bagian lain (scoring, regime detection, exhaustion confirmation, learning
+  layer, risk cap ATR/persentase, symbol list, threading) TIDAK diubah.
 """
 
 import os
@@ -44,18 +56,7 @@ ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
 # -----------------------------------------------------------------------
-# Risk Management — v20.1 FIX
-# Logika: sinyal REVERSED, jadi kita masuk berlawanan arah sinyal
-#
-# ATR_MULT_SL = 1.0  → SL ketat 1.0x ATR (potong cepat kalau salah arah)
-# ATR_MULT_TP = 1.8  → TP lebar 1.8x ATR (win harus > loss = RR 1.8)
-#
-# Cap hard limits:
-#   MAX_TP_PCT = 0.0025 → HardSL maksimal 0.25% dari entry
-#   MAX_SL_PCT = 0.010  → TP cap maksimal 1.0% dari entry
-#
-# Hasil RR sesungguhnya = 1.8 / 1.0 = 1.8 (positif!)
-# Sebelumnya: 2.5 / 1.2 = 2.08 tapi TERBALIK, jadi loss/win = 2.08 (rugi!)
+# Risk Management — angka TIDAK diubah dari v20.1
 # -----------------------------------------------------------------------
 ATR_MULT_SL = 1.0      # SL = 1.0x ATR — ketat, potong cepat
 ATR_MULT_TP = 1.8      # TP = 1.8x ATR — lebih lebar dari SL
@@ -64,10 +65,7 @@ MAX_SL_PCT = 0.010     # Cap TP maksimal 1.0% (realistis untuk scalping)
 MAX_TP_PCT = 0.0025    # Cap HardSL maksimal 0.25% (lindungi modal)
 
 # -----------------------------------------------------------------------
-# Trailing Stop — v20.1 FIX
-# Aktif di 0.35% (bukan 0.25%) — beri napas lebih ke posisi
-# Callback 0.15% (bukan 0.10%) — tidak terlalu ketat, hindari premature exit
-# Floor 0.20% (bukan 0.15%) — cover fee 0.10% x2 + bersih minimal 0.10%
+# Trailing Stop — angka TIDAK diubah dari v20.1
 # -----------------------------------------------------------------------
 TRAIL_ACTIVATE_PCT = 0.0035   # Profit 0.35% baru trailing aktif
 TRAIL_CALLBACK_PCT = 0.0015   # Jarak trailing 0.15% dari pucuk profit
@@ -606,38 +604,29 @@ class SignalScorer:
         return score, signals
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER — v20.1 FIX
+#  RISK MANAGER — angka TIDAK diubah dari v20.1
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, atr: float, direction: str) -> Tuple[float, float, float, float]:
-        # ---------------------------------------------------------------
-        # v20.1 FIX: Naming sekarang sudah benar dan konsisten
-        # SL = ketat 1.0x ATR — potong cepat kalau arah salah
-        # TP = lebar 1.8x ATR — win harus lebih besar dari loss (RR 1.8)
-        # ---------------------------------------------------------------
         sl_distance = ATR_MULT_SL * atr   # 1.0x ATR → ketat
         tp_distance = ATR_MULT_TP * atr   # 1.8x ATR → lebar
 
         # Minimal TP 0.20% dari entry
-        # (cover fee 0.10% x2 round-trip + bersih minimal 0.10%)
         min_tp_distance = entry_price * 0.0020
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
         # Cap SL: maksimal 0.25% dari entry (MAX_TP_PCT = 0.0025)
-        # Jangan sampai 1 trade bisa hancurkan portofolio
         max_sl = entry_price * MAX_TP_PCT
 
         # Cap TP: maksimal 1.0% dari entry (MAX_SL_PCT = 0.010)
-        # Realistis untuk scalping timeframe 5m
         max_tp = entry_price * MAX_SL_PCT
 
         sl_distance = min(sl_distance, max_sl)
         tp_distance = min(tp_distance, max_tp)
 
-        # Safety: pastikan TP tidak di bawah minimum setelah di-cap
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
@@ -716,6 +705,7 @@ class LearningLayer:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _precision_cache = {}
+_price_precision_cache = {}
 _ohlcv_cache = {}
 _ticker_cache = {}
 _ticker_ts = 0
@@ -743,6 +733,23 @@ def get_precision(symbol):
                 return prec
     except: pass
     return 2
+
+def get_price_precision(symbol):
+    """Dipakai untuk membulatkan stopPrice order SL/TP exchange-side biar nggak ditolak Binance."""
+    if symbol in _price_precision_cache: return _price_precision_cache[symbol]
+    try:
+        info = client.futures_exchange_info()
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                prec = int(s['pricePrecision'])
+                _price_precision_cache[symbol] = prec
+                return prec
+    except: pass
+    return 4
+
+def round_price(symbol, price):
+    prec = get_price_precision(symbol)
+    return round(price, prec)
 
 def qty(symbol, price):
     raw_qty = (ORDER_USDT * LEVERAGE) / price
@@ -840,6 +847,56 @@ learning = LearningLayer(signal_weights)
 #  CORE TRADING FUNCTIONS (API TESTNET ENABLED)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def cancel_order_safe(sym, order_id):
+    """Cancel order dengan aman — kalau order udah filled/cancelled duluan, abaikan errornya."""
+    if not order_id: return
+    try:
+        client.futures_cancel_order(symbol=sym, orderId=order_id)
+    except Exception:
+        pass
+
+def place_exchange_sl_tp(sym, direction, sl_price, tp_price):
+    """
+    Pasang STOP_MARKET (SL) dan TAKE_PROFIT_MARKET (TP) langsung di exchange,
+    closePosition=True (otomatis nutup full posisi, reduceOnly implisit),
+    workingType=MARK_PRICE (lebih tahan terhadap wick manipulation).
+    Ini yang ngegantiin pengecekan SL/TP manual di polling loop — exchange
+    yang eksekusi begitu harga nyentuh level, bukan nunggu loop Python.
+    """
+    close_side = "SELL" if direction == "LONG" else "BUY"
+    sl_px = round_price(sym, sl_price)
+    tp_px = round_price(sym, tp_price)
+    sl_order_id = None
+    tp_order_id = None
+    
+    try:
+        sl_order = client.futures_create_order(
+            symbol=sym,
+            side=close_side,
+            type='STOP_MARKET',
+            stopPrice=sl_px,
+            closePosition=True,
+            workingType='MARK_PRICE'
+        )
+        sl_order_id = sl_order.get('orderId')
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal pasang SL exchange-side {sym}: {e}")
+    
+    try:
+        tp_order = client.futures_create_order(
+            symbol=sym,
+            side=close_side,
+            type='TAKE_PROFIT_MARKET',
+            stopPrice=tp_px,
+            closePosition=True,
+            workingType='MARK_PRICE'
+        )
+        tp_order_id = tp_order.get('orderId')
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal pasang TP exchange-side {sym}: {e}")
+    
+    return sl_order_id, tp_order_id
+
 def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
@@ -875,42 +932,47 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
         print(f"\n  ❌ [API ERROR] Gagal open posisi {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
         return
-
+    
+    # Pasang SL/TP betulan di exchange — bukan cuma dipantau di software
+    sl_order_id, tp_order_id = place_exchange_sl_tp(sym, direction, sl_price, tp_price)
+    
+    if sl_order_id is None:
+        # SL gagal kepasang → posisi nggak terlindungi, langsung force-close demi keamanan
+        print(f"\n  ⚠️  [SAFETY] SL gagal terpasang di {sym}, posisi langsung ditutup paksa")
+        binance_close_side = "SELL" if direction == "LONG" else "BUY"
+        try:
+            client.futures_create_order(
+                symbol=sym, side=binance_close_side, type='MARKET',
+                reduceOnly=True, quantity=q_val
+            )
+        except Exception as e:
+            print(f"\n  ❌ [API ERROR] Gagal force-close {sym} setelah SL gagal: {e}")
+        if tp_order_id:
+            cancel_order_safe(sym, tp_order_id)
+        with _lock: live_positions.pop(sym, None)
+        return
+    
     pos = {
         "side": direction, "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
         "sl_price": sl_price, "tp_price": tp_price,
         "sl_pct": sl_pct, "tp_pct": tp_pct,
+        "sl_order_id": sl_order_id, "tp_order_id": tp_order_id,
         "regime": regime, "bias": bias
     }
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if direction == "LONG" else "🔴"
     print(f"\n  {d} [LIVE TESTNET] {sym} {direction} @{price:.6g} | SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% | RR:{tp_pct/sl_pct:.2f} | Regime:{regime}")
+    print(f"        Exchange order: SL#{sl_order_id}@{sl_price:.6g} TP#{tp_order_id}@{tp_price:.6g}")
     print(f"        Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
-def live_close(sym, reason, price=None):
-    with _lock:
-        pos = live_positions.pop(sym, None)
-    if pos is None or pos.get("_r"): return
-    
-    if price is None: price = price_live(sym)
-    if price == 0: return
-    
+def _record_close(sym, pos, reason, price):
+    """Bagian bookkeeping (PnL, stats, learning, trade_log) — dipakai baik untuk
+    close manual (MARKET) maupun close yang udah kejadian di exchange (SL/TP fill)."""
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     
-    binance_close_side = "SELL" if side == "LONG" else "BUY"
-    try:
-        client.futures_create_order(
-            symbol=sym,
-            side=binance_close_side,
-            type='MARKET',
-            quantity=q_val
-        )
-    except Exception as e:
-        print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}")
-
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
     total_fee = (entry * q_val + price * q_val) * fee_rate
@@ -953,8 +1015,51 @@ def live_close(sym, reason, price=None):
     _rescan_q.put(1)
     print_inline()
 
+def live_close(sym, reason, price=None):
+    """Tutup posisi via MARKET order — dipakai untuk TrailingTP / close manual.
+    Cancel dulu order SL/TP exchange-side yang masih nempel sebelum close,
+    biar nggak ada double-execution."""
+    with _lock:
+        pos = live_positions.pop(sym, None)
+    if pos is None or pos.get("_r"): return
+    
+    cancel_order_safe(sym, pos.get("sl_order_id"))
+    cancel_order_safe(sym, pos.get("tp_order_id"))
+    
+    if price is None: price = price_live(sym)
+    if price == 0: return
+    
+    side, q_val = pos["side"], pos["qty"]
+    binance_close_side = "SELL" if side == "LONG" else "BUY"
+    try:
+        client.futures_create_order(
+            symbol=sym,
+            side=binance_close_side,
+            type='MARKET',
+            reduceOnly=True,
+            quantity=q_val
+        )
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}")
+    
+    _record_close(sym, pos, reason, price)
+
+def live_close_filled_by_exchange(sym, reason, fill_price):
+    """Dipanggil saat posisi udah ketutup duluan oleh STOP_MARKET/TAKE_PROFIT_MARKET
+    di exchange. Tinggal cancel order pasangannya yang masih nganggur + bookkeeping."""
+    with _lock:
+        pos = live_positions.pop(sym, None)
+    if pos is None or pos.get("_r"): return
+    
+    if reason == "HardSL":
+        cancel_order_safe(sym, pos.get("tp_order_id"))
+    else:
+        cancel_order_safe(sym, pos.get("sl_order_id"))
+    
+    _record_close(sym, pos, reason, fill_price)
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  MONITOR POSITIONS — v20.1 FIX (DYNAMIC TRAILING TAKE PROFIT)
+#  MONITOR POSITIONS — v20.2 (TRAILING TP DI SOFTWARE, SL/TP UTAMA DI EXCHANGE)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def monitor_positions():
@@ -967,59 +1072,62 @@ def monitor_positions():
         
         side = pos["side"]
         entry = pos["entry"]
-        sl_px = pos["sl_price"]
-        tp_px = pos["tp_price"]
         
         # 1. Hitung persentase PnL saat ini (positif = profit, negatif = loss)
         if side == "LONG":
             pnl_pct = (px - entry) / entry
         else:
             pnl_pct = (entry - px) / entry
-            
+        
         # 2. Rekam puncak PnL tertinggi yang pernah dicapai posisi ini
         if "max_pnl_pct" not in pos:
             pos["max_pnl_pct"] = pnl_pct
         elif pnl_pct > pos["max_pnl_pct"]:
             pos["max_pnl_pct"] = pnl_pct
-            
+        
         # 3. ==========================================
-        #    LOGIKA DYNAMIC TRAILING TAKE PROFIT (v20.1)
+        #    DYNAMIC TRAILING TAKE PROFIT — TIDAK BERUBAH dari v20.1
+        #    Ini masih dicek di software karena levelnya bergerak dinamis
+        #    (nggak bisa direpresentasikan sebagai satu STOP order statis).
         #    ==========================================
-        # Posisi WAJIB menyentuh TRAIL_ACTIVATE_PCT (0.35%) dulu
-        # sebelum trailing aktif — beri napas lebih ke posisi
         if pos["max_pnl_pct"] >= TRAIL_ACTIVATE_PCT:
-            
-            # Titik cut = puncak tertinggi dikurangi callback (0.15%)
-            # Makin tinggi puncaknya, titik cut ikut naik otomatis
             dynamic_limit = pos["max_pnl_pct"] - TRAIL_CALLBACK_PCT
-            
-            # Pastikan titik cut tidak pernah di bawah floor 0.20%
-            # (cover fee round-trip 0.10% + bersih minimal 0.10%)
             trailing_limit = max(TRAIL_MIN_FLOOR, dynamic_limit)
             
-            # Kalau harga balik menyentuh garis trailing → CLOSE
             if pnl_pct <= trailing_limit:
                 live_close(sym, "TrailingTP", px)
                 continue
-
+        
         # 4. ==========================================
-        #    HARD SL & EXTREME TP (safety net)
+        #    CEK APAKAH POSISI UDAH DITUTUP DI EXCHANGE
+        #    (STOP_MARKET / TAKE_PROFIT_MARKET ke-fill)
         #    ==========================================
-        # HardSL terpicu kalau harga melewati batas SL (0.25% max)
-        # ExtremeTP terpicu kalau profit melewati batas TP (1.0% max)
-        if side == "LONG":
-            if px <= sl_px:
-                live_close(sym, "HardSL", px); continue
-            if px >= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
-        else:
-            if px >= sl_px:
-                live_close(sym, "HardSL", px); continue
-            if px <= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+        try:
+            pinfo = client.futures_position_information(symbol=sym)
+            amt = float(pinfo[0]["positionAmt"]) if pinfo else 0.0
+        except Exception:
+            continue
+        
+        if amt == 0:
+            reason, fill_price = "HardSL", px
+            try:
+                tp_id = pos.get("tp_order_id")
+                sl_id = pos.get("sl_order_id")
+                if tp_id:
+                    tp_o = client.futures_get_order(symbol=sym, orderId=tp_id)
+                    if tp_o.get("status") == "FILLED":
+                        reason = "ExtremeTP"
+                        fill_price = float(tp_o.get("avgPrice") or px)
+                if reason == "HardSL" and sl_id:
+                    sl_o = client.futures_get_order(symbol=sym, orderId=sl_id)
+                    if sl_o.get("status") == "FILLED":
+                        fill_price = float(sl_o.get("avgPrice") or px)
+            except Exception:
+                pass
+            live_close_filled_by_exchange(sym, reason, fill_price)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD (REVERSED LOGIC EMBEDDED)
+#  SCANNER THREAD
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -1040,14 +1148,7 @@ def scan_one(sym):
         direction, score, sigs, atr_val, _, _, regime, bias = scorer.get_signal(df_ta, sym)
         if direction is None: return None
 
-        # Reversed logic: sinyal LONG → eksekusi SHORT, sinyal SHORT → eksekusi LONG
-        if direction == "LONG":
-            direction = "SHORT"
-            sigs = ["REV_SHORT"] + sigs 
-        elif direction == "SHORT":
-            direction = "LONG"
-            sigs = ["REV_LONG"] + sigs   
-
+        # Arah ORIGINAL (non-reversed): sinyal LONG → eksekusi LONG, sinyal SHORT → eksekusi SHORT
         px_live = price_live(sym)
         if px_live == 0: return None
         return (sym, direction, score, sigs, px_live, atr_val, regime, bias)
@@ -1095,7 +1196,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"        ┌ [v20.1 LIVE TESTNET] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"        ┌ [v20.2 LIVE TESTNET] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"        └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -1106,12 +1207,12 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ LIVE TESTNET v20.1 — REGIME-AWARE ADAPTIVE TRADING")
+    print(f"    ✅ LIVE TESTNET v20.2 — REGIME-AWARE ADAPTIVE TRADING (ORIGINAL DIR + EXCHANGE SL/TP)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  SL:1.0xATR(cap 0.25%) | TP:1.8xATR(cap 1.0%) | Trail@0.35%/0.15%cb/0.20%floor")
+    print(f"    ⚙️  SL:1.0xATR(cap 0.25%) | TP:1.8xATR(cap 1.0%) | Trail@0.35%/0.15%cb/0.20%floor | SL/TP=exchange-side")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -1194,9 +1295,10 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ LIVE TESTNET v20.1 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
-    print("║  ✅ FIX: SL 1.0xATR(0.25% cap) | TP 1.8xATR(1.0% cap) | RR~1.8   ║")
-    print("║  ✅ Trail aktif@0.35% | callback 0.15% | floor 0.20%              ║")
+    print("║  ✅ LIVE TESTNET v20.2 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
+    print("║  ✅ Entry: arah ORIGINAL (non-reversed)                            ║")
+    print("║  ✅ SL/TP: STOP_MARKET + TAKE_PROFIT_MARKET di exchange            ║")
+    print("║  ✅ Trail aktif@0.35% | callback 0.15% | floor 0.20%               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
