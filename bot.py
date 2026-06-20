@@ -1,14 +1,15 @@
 """
-Bot Scalping v20.0.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)
+Bot Scalping v20.1.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED)
 =============================================================
-PERUBAHAN FUNDAMENTAL dari v19.4.0 (Plus Reversed Logic):
-1. Market Regime Detection (5 regime: TRENDING_BULL, TRENDING_BEAR, RANGE, VOLATILE, EXHAUSTION)
-2. Trend Following saat regime TRENDING (TIDAK fade)
-3. Exhaustion Confirmation Layer: minimal 3 dari 9 kondisi untuk fade
-4. ATR-based TP/SL (REVERSED: TP menggunakan SL lama, SL menggunakan TP lama)
-5. Self-Learning Signal Weighting (adaptive scoring berdasarkan historical win rate)
-6. Logika Reversed: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-7. Garansi TP Minimal 0.15% untuk mengamankan dari fee.
+PERUBAHAN dari v20.0.0:
+- FIX KRITIS: RR Ratio diperbaiki dari ~0.48 (rugi) menjadi ~1.8 (profit)
+- SL lebih ketat: 1.0x ATR (dari 2.5x) — potong cepat kalau arah salah
+- TP lebih lebar: 1.8x ATR (dari 1.2x) — biar win lebih besar dari loss
+- HardSL cap diturunkan: 0.25% (dari 0.4%) — lindungi modal lebih baik
+- TP cap dinaikkan: 1.0% (dari 1.5%) — realistis untuk scalping
+- Trailing aktif di 0.35% (dari 0.25%) — beri napas lebih ke posisi
+- Trailing callback 0.15% (dari 0.10%) — tidak terlalu ketat
+- Trailing floor 0.20% (dari 0.15%) — lock profit lebih baik + cover fee
 
 Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
 """
@@ -42,17 +43,35 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# Risk Management (Akan ditukar di RiskManager)
-ATR_MULT_SL = 1.2      # Awalnya SL, sekarang dipakai untuk TP
-ATR_MULT_TP = 2.5      # Awalnya TP, sekarang dipakai untuk SL
-MIN_RR_RATIO = 1.8     
-MAX_SL_PCT = 0.015     # Maksimum SL persen (akan ditukar jadi batas TP maksimal)
-MAX_TP_PCT = 0.004     # Maksimum TP persen (Ditukar -> Ini adalah HardSL 0.4%)
+# -----------------------------------------------------------------------
+# Risk Management — v20.1 FIX
+# Logika: sinyal REVERSED, jadi kita masuk berlawanan arah sinyal
+#
+# ATR_MULT_SL = 1.0  → SL ketat 1.0x ATR (potong cepat kalau salah arah)
+# ATR_MULT_TP = 1.8  → TP lebar 1.8x ATR (win harus > loss = RR 1.8)
+#
+# Cap hard limits:
+#   MAX_TP_PCT = 0.0025 → HardSL maksimal 0.25% dari entry
+#   MAX_SL_PCT = 0.010  → TP cap maksimal 1.0% dari entry
+#
+# Hasil RR sesungguhnya = 1.8 / 1.0 = 1.8 (positif!)
+# Sebelumnya: 2.5 / 1.2 = 2.08 tapi TERBALIK, jadi loss/win = 2.08 (rugi!)
+# -----------------------------------------------------------------------
+ATR_MULT_SL = 1.0      # SL = 1.0x ATR — ketat, potong cepat
+ATR_MULT_TP = 1.8      # TP = 1.8x ATR — lebih lebar dari SL
+MIN_RR_RATIO = 1.8
+MAX_SL_PCT = 0.010     # Cap TP maksimal 1.0% (realistis untuk scalping)
+MAX_TP_PCT = 0.0025    # Cap HardSL maksimal 0.25% (lindungi modal)
 
-# Trailing Stop Management (BARU)
-TRAIL_ACTIVATE_PCT = 0.0025   # Profit 0.25% baru trailing aktif (biar nafas dulu)
-TRAIL_CALLBACK_PCT = 0.0010   # Jarak trailing 0.10% dari pucuk profit
-TRAIL_MIN_FLOOR = 0.0015      # Batas bawah mutlak (Fee 0.1% + Bersih 0.05%)
+# -----------------------------------------------------------------------
+# Trailing Stop — v20.1 FIX
+# Aktif di 0.35% (bukan 0.25%) — beri napas lebih ke posisi
+# Callback 0.15% (bukan 0.10%) — tidak terlalu ketat, hindari premature exit
+# Floor 0.20% (bukan 0.15%) — cover fee 0.10% x2 + bersih minimal 0.10%
+# -----------------------------------------------------------------------
+TRAIL_ACTIVATE_PCT = 0.0035   # Profit 0.35% baru trailing aktif
+TRAIL_CALLBACK_PCT = 0.0015   # Jarak trailing 0.15% dari pucuk profit
+TRAIL_MIN_FLOOR = 0.0020      # Batas bawah mutlak 0.20% (fee + profit bersih)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -587,38 +606,50 @@ class SignalScorer:
         return score, signals
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER (REVERSED)
+#  RISK MANAGER — v20.1 FIX
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, atr: float, direction: str) -> Tuple[float, float, float, float]:
-        sl_distance = ATR_MULT_TP * atr  
-        tp_distance = ATR_MULT_SL * atr  
+        # ---------------------------------------------------------------
+        # v20.1 FIX: Naming sekarang sudah benar dan konsisten
+        # SL = ketat 1.0x ATR — potong cepat kalau arah salah
+        # TP = lebar 1.8x ATR — win harus lebih besar dari loss (RR 1.8)
+        # ---------------------------------------------------------------
+        sl_distance = ATR_MULT_SL * atr   # 1.0x ATR → ketat
+        tp_distance = ATR_MULT_TP * atr   # 1.8x ATR → lebar
 
-        min_tp_distance = entry_price * 0.0015
+        # Minimal TP 0.20% dari entry
+        # (cover fee 0.10% x2 round-trip + bersih minimal 0.10%)
+        min_tp_distance = entry_price * 0.0020
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
+        # Cap SL: maksimal 0.25% dari entry (MAX_TP_PCT = 0.0025)
+        # Jangan sampai 1 trade bisa hancurkan portofolio
         max_sl = entry_price * MAX_TP_PCT
+
+        # Cap TP: maksimal 1.0% dari entry (MAX_SL_PCT = 0.010)
+        # Realistis untuk scalping timeframe 5m
         max_tp = entry_price * MAX_SL_PCT
 
         sl_distance = min(sl_distance, max_sl)
         tp_distance = min(tp_distance, max_tp)
 
+        # Safety: pastikan TP tidak di bawah minimum setelah di-cap
         if tp_distance < min_tp_distance:
             tp_distance = min_tp_distance
 
         if direction == "LONG":
             sl_price = entry_price - sl_distance
             tp_price = entry_price + tp_distance
-            sl_pct = sl_distance / entry_price
-            tp_pct = tp_distance / entry_price
         else:
             sl_price = entry_price + sl_distance
             tp_price = entry_price - tp_distance
-            sl_pct = sl_distance / entry_price
-            tp_pct = tp_distance / entry_price
+
+        sl_pct = sl_distance / entry_price
+        tp_pct = tp_distance / entry_price
 
         return sl_price, tp_price, sl_pct, tp_pct
 
@@ -923,7 +954,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MONITOR POSITIONS (DYNAMIC TRAILING TAKE PROFIT)
+#  MONITOR POSITIONS — v20.1 FIX (DYNAMIC TRAILING TAKE PROFIT)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def monitor_positions():
@@ -939,48 +970,52 @@ def monitor_positions():
         sl_px = pos["sl_price"]
         tp_px = pos["tp_price"]
         
-        # 1. Hitung persentase PnL saat ini (Positif = Profit, Negatif = Minus)
+        # 1. Hitung persentase PnL saat ini (positif = profit, negatif = loss)
         if side == "LONG":
             pnl_pct = (px - entry) / entry
         else:
             pnl_pct = (entry - px) / entry
             
-        # 2. Rekam jejak PnL tertinggi yang pernah dicapai
+        # 2. Rekam puncak PnL tertinggi yang pernah dicapai posisi ini
         if "max_pnl_pct" not in pos:
             pos["max_pnl_pct"] = pnl_pct
         elif pnl_pct > pos["max_pnl_pct"]:
             pos["max_pnl_pct"] = pnl_pct
             
         # 3. ==========================================
-        #    LOGIKA DYNAMIC TRAILING TAKE PROFIT
+        #    LOGIKA DYNAMIC TRAILING TAKE PROFIT (v20.1)
         #    ==========================================
-        # Wajib nyentuh batas Aktif dulu (0.25%) biar bisa nafas!
+        # Posisi WAJIB menyentuh TRAIL_ACTIVATE_PCT (0.35%) dulu
+        # sebelum trailing aktif — beri napas lebih ke posisi
         if pos["max_pnl_pct"] >= TRAIL_ACTIVATE_PCT:
             
-            # Titik cut dinamis = pucuk tertinggi dikurangi callback (0.10%)
-            # Jadi makin pucuknya terbang, titik cut ini otomatis ikut narik ke atas
+            # Titik cut = puncak tertinggi dikurangi callback (0.15%)
+            # Makin tinggi puncaknya, titik cut ikut naik otomatis
             dynamic_limit = pos["max_pnl_pct"] - TRAIL_CALLBACK_PCT
             
-            # Pastikan titik cut tidak pernah lebih rendah dari minimal profit (0.15%)
+            # Pastikan titik cut tidak pernah di bawah floor 0.20%
+            # (cover fee round-trip 0.10% + bersih minimal 0.10%)
             trailing_limit = max(TRAIL_MIN_FLOOR, dynamic_limit)
             
-            # Kalau harga turun nyentuh garis trailing, EKSEKUSI!
+            # Kalau harga balik menyentuh garis trailing → CLOSE
             if pnl_pct <= trailing_limit:
                 live_close(sym, "TrailingTP", px)
                 continue
 
         # 4. ==========================================
-        #    LOGIKA PENJAGAAN HARD SL & EXTREME TP
+        #    HARD SL & EXTREME TP (safety net)
         #    ==========================================
+        # HardSL terpicu kalau harga melewati batas SL (0.25% max)
+        # ExtremeTP terpicu kalau profit melewati batas TP (1.0% max)
         if side == "LONG":
             if px <= sl_px:
                 live_close(sym, "HardSL", px); continue
-            if px >= tp_px:  
+            if px >= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
         else:
             if px >= sl_px:
                 live_close(sym, "HardSL", px); continue
-            if px <= tp_px:  
+            if px <= tp_px:
                 live_close(sym, "ExtremeTP", px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1005,6 +1040,7 @@ def scan_one(sym):
         direction, score, sigs, atr_val, _, _, regime, bias = scorer.get_signal(df_ta, sym)
         if direction is None: return None
 
+        # Reversed logic: sinyal LONG → eksekusi SHORT, sinyal SHORT → eksekusi LONG
         if direction == "LONG":
             direction = "SHORT"
             sigs = ["REV_SHORT"] + sigs 
@@ -1059,7 +1095,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"        ┌ [v20.0 LIVE TESTNET] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"        ┌ [v20.1 LIVE TESTNET] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"        └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -1070,12 +1106,12 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ LIVE TESTNET v20.0 — REGIME-AWARE ADAPTIVE TRADING")
+    print(f"    ✅ LIVE TESTNET v20.1 — REGIME-AWARE ADAPTIVE TRADING")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  TP/SL: REVERSED (TP 0.15% Min) | DYNAMIC TRAILING")
+    print(f"    ⚙️  SL:1.0xATR(cap 0.25%) | TP:1.8xATR(cap 1.0%) | Trail@0.35%/0.15%cb/0.20%floor")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -1158,9 +1194,9 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ LIVE TESTNET v20.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
-    print("║  ✅ REVERSED LOGIC + DYNAMIC TRAILING TP + HARDSL 0.4%             ║")
-    print("║  ✅ Self-Learning Signal Weights & Adaptive Scanning               ║")
+    print("║  ✅ LIVE TESTNET v20.1 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
+    print("║  ✅ FIX: SL 1.0xATR(0.25% cap) | TP 1.8xATR(1.0% cap) | RR~1.8   ║")
+    print("║  ✅ Trail aktif@0.35% | callback 0.15% | floor 0.20%              ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
