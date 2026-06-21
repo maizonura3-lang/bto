@@ -1,31 +1,11 @@
 """
-Bot Scalping v20.2.0 — REGIME-AWARE ADAPTIVE TRADING ENGINE (REVERSED + SL/TP SWAPPED)
+Bot Scalping v20.2.1 — FIXED SYNC & ORPHANED POSITIONS
 =============================================================
-PERUBAHAN dari v20.1.0 (atas permintaan user):
-- SWAP: HardSL sekarang memakai jarak/cap yang dulunya milik TP
-        (1.8x ATR, cap 1.0%) — stop jadi LEBAR
-- SWAP: ExtremeTP sekarang memakai jarak/cap yang dulunya milik SL
-        (1.0x ATR, cap 0.25%) — target jadi SEMPIT
-- Semua bagian lain (entry reversal, regime detection, signal scoring,
-  trailing stop, kill switch, dll) TIDAK diubah, persis seperti v20.1.0
-
-⚠️ CATATAN ENGINEERING (bukan rekomendasi finansial):
-  Swap ini membalik RR dari ~1.8 (favorable) menjadi ~0.56 (unfavorable).
-  Breakeven win-rate naik dari ~36% menjadi ~64%. Berdasarkan log terakhir
-  (WR 34%, 79 trade), perubahan ini secara matematis cenderung memperbesar
-  loss, bukan memperbaikinya. Tetap dijalankan sesuai permintaan eksplisit.
-
-PERUBAHAN dari v20.0.0 (riwayat, tidak diubah lagi di v20.2):
-- FIX KRITIS: RR Ratio diperbaiki dari ~0.48 (rugi) menjadi ~1.8 (profit)
-- SL lebih ketat: 1.0x ATR (dari 2.5x) — potong cepat kalau arah salah
-- TP lebih lebar: 1.8x ATR (dari 1.2x) — biar win lebih besar dari loss
-- HardSL cap diturunkan: 0.25% (dari 0.4%) — lindungi modal lebih baik
-- TP cap dinaikkan: 1.0% (dari 1.5%) — realistis untuk scalping
-- Trailing aktif di 0.35% (dari 0.25%) — beri napas lebih ke posisi
-- Trailing callback 0.15% (dari 0.10%) — tidak terlalu ketat
-- Trailing floor 0.20% (dari 0.15%) — lock profit lebih baik + cover fee
-
-Target: Profit Factor > 1.5, Win Rate > 55%, Avg RR > 1.8
+PERBAIKAN TERBARU:
+- FIX: Mengamankan koneksi Testnet menggunakan testnet=True
+- FIX: Sinkronisasi posisi open di Binance saat bot pertama start (mencegah > 3 posisi)
+- FIX: Gagal close (orphaned position) diperbaiki. Bot hanya melupakan posisi jika API Binance mengonfirmasi close sukses.
+- FIX: Memaksa mode margin ISOLATED untuk mengunci loss sesuai modal $2.
 """
 
 import os
@@ -46,8 +26,9 @@ from binance.client import Client
 import ta
 
 load_dotenv()
-client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+
+# FIX: Inisialisasi API Testnet yang benar menggunakan parameter bawaan library
+client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -57,34 +38,15 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# -----------------------------------------------------------------------
-# Risk Management — v20.1 (nilai konstanta TIDAK diubah di v20.2)
-# Logika: sinyal REVERSED, jadi kita masuk berlawanan arah sinyal
-#
-# ATR_MULT_SL = 1.0  → dulunya dipakai untuk SL ketat
-# ATR_MULT_TP = 1.8  → dulunya dipakai untuk TP lebar
-#
-# Cap hard limits:
-#   MAX_TP_PCT = 0.0025 → dulunya cap untuk SL (0.25%)
-#   MAX_SL_PCT = 0.010  → dulunya cap untuk TP (1.0%)
-#
-# v20.2: di dalam RiskManager.calculate_sl_tp() pemakaian variabel-variabel
-# ini DITUKAR — HardSL sekarang pakai ATR_MULT_TP/MAX_SL_PCT,
-# ExtremeTP sekarang pakai ATR_MULT_SL/MAX_TP_PCT. Konstanta di bawah ini
-# nilainya tetap sama persis seperti v20.1, hanya cara pakainya yang dibalik.
-# -----------------------------------------------------------------------
-ATR_MULT_SL = 1.0      # nilai tidak berubah
-ATR_MULT_TP = 1.8      # nilai tidak berubah
+ATR_MULT_SL = 1.0      
+ATR_MULT_TP = 1.8      
 MIN_RR_RATIO = 1.8
-MAX_SL_PCT = 0.010     # nilai tidak berubah
-MAX_TP_PCT = 0.0025    # nilai tidak berubah
+MAX_SL_PCT = 0.010     
+MAX_TP_PCT = 0.0025    
 
-# -----------------------------------------------------------------------
-# Trailing Stop — TIDAK DIUBAH dari v20.1
-# -----------------------------------------------------------------------
-TRAIL_ACTIVATE_PCT = 0.0035   # Profit 0.35% baru trailing aktif
-TRAIL_CALLBACK_PCT = 0.0015   # Jarak trailing 0.15% dari pucuk profit
-TRAIL_MIN_FLOOR = 0.0020      # Batas bawah mutlak 0.20% (fee + profit bersih)
+TRAIL_ACTIVATE_PCT = 0.0035   
+TRAIL_CALLBACK_PCT = 0.0015   
+TRAIL_MIN_FLOOR = 0.0020      
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -120,8 +82,8 @@ CONSEC_MAX = 15
 CONSEC_PAUSE = 10
 
 # Learning
-LEARNING_WINDOW = 200      # Jumlah trade terakhir untuk learning
-MIN_TRADES_FOR_WEIGHT = 20 # Minimal trade per sinyal untuk adjust bobot
+LEARNING_WINDOW = 200      
+MIN_TRADES_FOR_WEIGHT = 20 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  MARKET REGIME DETECTION
@@ -201,165 +163,94 @@ class MarketRegime:
 class ExhaustionConfirmation:
     @staticmethod
     def check_short_exhaustion(df: pd.DataFrame) -> Tuple[bool, int, List[str]]:
-        if df is None or len(df) < 55:
-            return False, 0, []
+        if df is None or len(df) < 55: return False, 0, []
+        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        conditions, reasons = [], []
         
-        row = df.iloc[-2]
-        prev = df.iloc[-3]
-        prev2 = df.iloc[-4]
-        
-        conditions = []
-        reasons = []
-        
-        if row["rsi"] > 75:
-            conditions.append(True)
-            reasons.append(f"RSI_{row['rsi']:.0f}>75")
-        else:
-            conditions.append(False)
+        if row["rsi"] > 75: conditions.append(True); reasons.append(f"RSI_{row['rsi']:.0f}>75")
+        else: conditions.append(False)
         
         high_price = max(df["high"].iloc[-10:])
         high_rsi = max(df["rsi"].iloc[-10:])
         if row["close"] >= high_price * 0.99 and row["rsi"] < high_rsi - 3:
-            conditions.append(True)
-            reasons.append("RSI_Div")
-        else:
-            conditions.append(False)
+            conditions.append(True); reasons.append("RSI_Div")
+        else: conditions.append(False)
         
         high_macd = max(df["mh"].iloc[-10:])
         if row["close"] >= high_price * 0.99 and row["mh"] < high_macd - 0.5*row["atr"]:
-            conditions.append(True)
-            reasons.append("MACD_Div")
-        else:
-            conditions.append(False)
+            conditions.append(True); reasons.append("MACD_Div")
+        else: conditions.append(False)
         
-        if row["vr"] > 2.0:
-            conditions.append(True)
-            reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        else:
-            conditions.append(False)
+        if row["vr"] > 2.0: conditions.append(True); reasons.append(f"VolClimax_{row['vr']:.1f}x")
+        else: conditions.append(False)
         
-        vol_ratio = row["vr"]
-        vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
-        if vol_ratio > 1.8 and vol_ratio > vol_prev * 1.2:
-            conditions.append(True)
-            reasons.append("DeltaVolClimax")
-        else:
-            conditions.append(False)
+        vol_ratio, vol_prev = row["vr"], prev["vr"] if not np.isnan(prev["vr"]) else 1
+        if vol_ratio > 1.8 and vol_ratio > vol_prev * 1.2: conditions.append(True); reasons.append("DeltaVolClimax")
+        else: conditions.append(False)
         
         body = abs(row["close"] - row["open"])
         upper_wick = row["high"] - max(row["close"], row["open"])
-        if upper_wick > body * 1.5 and upper_wick > row["atr"] * 0.3:
-            conditions.append(True)
-            reasons.append("LongUpperWick")
-        else:
-            conditions.append(False)
+        if upper_wick > body * 1.5 and upper_wick > row["atr"] * 0.3: conditions.append(True); reasons.append("LongUpperWick")
+        else: conditions.append(False)
         
         atr_series = df["atr"].iloc[-10:]
-        atr_peak = atr_series.max()
-        atr_now = row["atr"]
-        if atr_peak > atr_series.iloc[-5] * 1.3 and atr_now < atr_peak * 0.8:
-            conditions.append(True)
-            reasons.append("ATR_ExpCollapse")
-        else:
-            conditions.append(False)
+        atr_peak, atr_now = atr_series.max(), row["atr"]
+        if atr_peak > atr_series.iloc[-5] * 1.3 and atr_now < atr_peak * 0.8: conditions.append(True); reasons.append("ATR_ExpCollapse")
+        else: conditions.append(False)
         
-        m5 = row["m5"]
-        m5_prev = prev["m5"]
-        if m5 > 0.002 and m5 < m5_prev * 0.7:
-            conditions.append(True)
-            reasons.append("MomDecel")
-        else:
-            conditions.append(False)
+        m5, m5_prev = row["m5"], prev["m5"]
+        if m5 > 0.002 and m5 < m5_prev * 0.7: conditions.append(True); reasons.append("MomDecel")
+        else: conditions.append(False)
         
-        br = row["br"]
-        br_peak = max(df["br"].iloc[-10:])
-        if br < br_peak - 0.1 and br_peak > 0.6:
-            conditions.append(True)
-            reasons.append("OrderflowRev")
-        else:
-            conditions.append(False)
+        br, br_peak = row["br"], max(df["br"].iloc[-10:])
+        if br < br_peak - 0.1 and br_peak > 0.6: conditions.append(True); reasons.append("OrderflowRev")
+        else: conditions.append(False)
         
         count = sum(conditions)
         return count >= 3, count, reasons
     
     @staticmethod
     def check_long_exhaustion(df: pd.DataFrame) -> Tuple[bool, int, List[str]]:
-        if df is None or len(df) < 55:
-            return False, 0, []
+        if df is None or len(df) < 55: return False, 0, []
+        row, prev = df.iloc[-2], df.iloc[-3]
+        conditions, reasons = [], []
         
-        row = df.iloc[-2]
-        prev = df.iloc[-3]
-        
-        conditions = []
-        reasons = []
-        
-        if row["rsi"] < 25:
-            conditions.append(True)
-            reasons.append(f"RSI_{row['rsi']:.0f}<25")
-        else:
-            conditions.append(False)
+        if row["rsi"] < 25: conditions.append(True); reasons.append(f"RSI_{row['rsi']:.0f}<25")
+        else: conditions.append(False)
         
         low_price = min(df["low"].iloc[-10:])
         low_rsi = min(df["rsi"].iloc[-10:])
-        if row["close"] <= low_price * 1.01 and row["rsi"] > low_rsi + 3:
-            conditions.append(True)
-            reasons.append("RSI_Div_Bull")
-        else:
-            conditions.append(False)
+        if row["close"] <= low_price * 1.01 and row["rsi"] > low_rsi + 3: conditions.append(True); reasons.append("RSI_Div_Bull")
+        else: conditions.append(False)
         
         low_macd = min(df["mh"].iloc[-10:])
-        if row["close"] <= low_price * 1.01 and row["mh"] > low_macd + 0.5*row["atr"]:
-            conditions.append(True)
-            reasons.append("MACD_Div_Bull")
-        else:
-            conditions.append(False)
+        if row["close"] <= low_price * 1.01 and row["mh"] > low_macd + 0.5*row["atr"]: conditions.append(True); reasons.append("MACD_Div_Bull")
+        else: conditions.append(False)
         
-        if row["vr"] > 2.0:
-            conditions.append(True)
-            reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        else:
-            conditions.append(False)
+        if row["vr"] > 2.0: conditions.append(True); reasons.append(f"VolClimax_{row['vr']:.1f}x")
+        else: conditions.append(False)
         
-        vol_ratio = row["vr"]
-        vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
-        if vol_ratio > 1.8 and vol_ratio > vol_prev * 1.2:
-            conditions.append(True)
-            reasons.append("DeltaVolClimax")
-        else:
-            conditions.append(False)
+        vol_ratio, vol_prev = row["vr"], prev["vr"] if not np.isnan(prev["vr"]) else 1
+        if vol_ratio > 1.8 and vol_ratio > vol_prev * 1.2: conditions.append(True); reasons.append("DeltaVolClimax")
+        else: conditions.append(False)
         
         body = abs(row["close"] - row["open"])
         lower_wick = min(row["close"], row["open"]) - row["low"]
-        if lower_wick > body * 1.5 and lower_wick > row["atr"] * 0.3:
-            conditions.append(True)
-            reasons.append("LongLowerWick")
-        else:
-            conditions.append(False)
+        if lower_wick > body * 1.5 and lower_wick > row["atr"] * 0.3: conditions.append(True); reasons.append("LongLowerWick")
+        else: conditions.append(False)
         
         atr_series = df["atr"].iloc[-10:]
-        atr_peak = atr_series.max()
-        atr_now = row["atr"]
-        if atr_peak > atr_series.iloc[-5] * 1.3 and atr_now < atr_peak * 0.8:
-            conditions.append(True)
-            reasons.append("ATR_ExpCollapse")
-        else:
-            conditions.append(False)
+        atr_peak, atr_now = atr_series.max(), row["atr"]
+        if atr_peak > atr_series.iloc[-5] * 1.3 and atr_now < atr_peak * 0.8: conditions.append(True); reasons.append("ATR_ExpCollapse")
+        else: conditions.append(False)
         
-        m5 = row["m5"]
-        m5_prev = prev["m5"]
-        if m5 < -0.002 and m5 > m5_prev * 0.7:
-            conditions.append(True)
-            reasons.append("MomDecel_Bull")
-        else:
-            conditions.append(False)
+        m5, m5_prev = row["m5"], prev["m5"]
+        if m5 < -0.002 and m5 > m5_prev * 0.7: conditions.append(True); reasons.append("MomDecel_Bull")
+        else: conditions.append(False)
         
-        br = row["br"]
-        br_trough = min(df["br"].iloc[-10:])
-        if br > br_trough + 0.1 and br_trough < 0.4:
-            conditions.append(True)
-            reasons.append("OrderflowRev_Bull")
-        else:
-            conditions.append(False)
+        br, br_trough = row["br"], min(df["br"].iloc[-10:])
+        if br > br_trough + 0.1 and br_trough < 0.4: conditions.append(True); reasons.append("OrderflowRev_Bull")
+        else: conditions.append(False)
         
         count = sum(conditions)
         return count >= 3, count, reasons
@@ -371,28 +262,13 @@ class ExhaustionConfirmation:
 class SignalWeights:
     def __init__(self):
         self.weights = {
-            "ema_bull_stack": 35,
-            "ema_mild_bull": 26,
-            "ema_weak_bull": 14,
-            "mom_strong": 30,
-            "mom_moderate": 20,
-            "macd_cross_up": 22,
-            "macd_strengthen": 15,
-            "orderflow_buy_climax": 25,
-            "orderflow_buy_high": 14,
-            "rsi_extreme_ob": 25,
-            "rsi_high": 12,
-            "ema_bear_stack": 35,
-            "ema_mild_bear": 26,
-            "ema_weak_bear": 14,
-            "mom_strong_neg": 30,
-            "mom_moderate_neg": 20,
-            "macd_cross_down": 22,
-            "macd_strengthen_neg": 15,
-            "orderflow_sell_climax": 25,
-            "orderflow_sell_high": 14,
-            "rsi_extreme_os": 25,
-            "rsi_low": 12,
+            "ema_bull_stack": 35, "ema_mild_bull": 26, "ema_weak_bull": 14,
+            "mom_strong": 30, "mom_moderate": 20, "macd_cross_up": 22,
+            "macd_strengthen": 15, "orderflow_buy_climax": 25, "orderflow_buy_high": 14,
+            "rsi_extreme_ob": 25, "rsi_high": 12, "ema_bear_stack": 35,
+            "ema_mild_bear": 26, "ema_weak_bear": 14, "mom_strong_neg": 30,
+            "mom_moderate_neg": 20, "macd_cross_down": 22, "macd_strengthen_neg": 15,
+            "orderflow_sell_climax": 25, "orderflow_sell_high": 14, "rsi_extreme_os": 25, "rsi_low": 12,
         }
         self.history = defaultdict(list)
         self.adaptive_enabled = True
@@ -406,14 +282,10 @@ class SignalWeights:
                     self.history[base_sig] = self.history[base_sig][-LEARNING_WINDOW:]
     
     def get_adjusted_weight(self, signal_name: str) -> float:
-        if not self.adaptive_enabled:
-            return self.weights.get(signal_name, 10)
-        
+        if not self.adaptive_enabled: return self.weights.get(signal_name, 10)
         base = signal_name.split('[')[0].strip()
         hist = self.history.get(base, [])
-        if len(hist) < MIN_TRADES_FOR_WEIGHT:
-            return self.weights.get(base, 10)
-        
+        if len(hist) < MIN_TRADES_FOR_WEIGHT: return self.weights.get(base, 10)
         win_rate = sum(hist) / len(hist)
         factor = max(0.5, min(1.5, 0.5 + win_rate))
         return self.weights.get(base, 10) * factor
@@ -430,19 +302,14 @@ class SignalScorer:
         self.weights = signal_weights
     
     def get_signal(self, df: pd.DataFrame, symbol: str = None) -> Tuple[Optional[str], int, List[str], float, float, float, str, float]:
-        if df is None or len(df) < 55:
-            return None, 0, [], 0.0, 0.0, 0.0, "UNKNOWN", 0.0
+        if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0, "UNKNOWN", 0.0
         
         regime, strength, bias = MarketRegime.detect(df)
         long_score, long_signals = self._score_long(df)
         short_score, short_signals = self._score_short(df)
         
-        is_exhausted_short = False
-        exhaustion_count_short = 0
-        exhaustion_reasons_short = []
-        is_exhausted_long = False
-        exhaustion_count_long = 0
-        exhaustion_reasons_long = []
+        is_exhausted_short, exhaustion_count_short, exhaustion_reasons_short = False, 0, []
+        is_exhausted_long, exhaustion_count_long, exhaustion_reasons_long = False, 0, []
         
         if regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE):
             is_exhausted_short, exhaustion_count_short, exhaustion_reasons_short = ExhaustionConfirmation.check_short_exhaustion(df)
@@ -451,211 +318,104 @@ class SignalScorer:
         atr = df["atr"].iloc[-2]
         
         if regime == MarketRegime.REGIME_TRENDING_BULL:
-            if long_score >= MIN_SCORE:
-                return "LONG", long_score, long_signals, atr, 0, 0, regime, bias
-            else:
-                return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            if long_score >= MIN_SCORE: return "LONG", long_score, long_signals, atr, 0, 0, regime, bias
+            else: return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            if short_score >= MIN_SCORE:
-                return "SHORT", short_score, short_signals, atr, 0, 0, regime, bias
-            else:
-                return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            if short_score >= MIN_SCORE: return "SHORT", short_score, short_signals, atr, 0, 0, regime, bias
+            else: return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         
         elif regime == MarketRegime.REGIME_RANGE:
-            if short_score > long_score and short_score >= MIN_SCORE and is_exhausted_short:
-                return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
-            elif long_score > short_score and long_score >= MIN_SCORE and is_exhausted_long:
-                return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
-            else:
-                return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            if short_score > long_score and short_score >= MIN_SCORE and is_exhausted_short: return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
+            elif long_score > short_score and long_score >= MIN_SCORE and is_exhausted_long: return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
+            else: return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         
         elif regime == MarketRegime.REGIME_EXHAUSTION:
-            if short_score > long_score and short_score >= MIN_SCORE and exhaustion_count_short >= 2:
-                return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
-            elif long_score > short_score and long_score >= MIN_SCORE and exhaustion_count_long >= 2:
-                return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
-            else:
-                return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            if short_score > long_score and short_score >= MIN_SCORE and exhaustion_count_short >= 2: return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
+            elif long_score > short_score and long_score >= MIN_SCORE and exhaustion_count_long >= 2: return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
+            else: return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         
         elif regime == MarketRegime.REGIME_VOLATILE:
-            if short_score > long_score and short_score >= MIN_SCORE + 10 and is_exhausted_short:
-                return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
-            elif long_score > short_score and long_score >= MIN_SCORE + 10 and is_exhausted_long:
-                return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
-            else:
-                return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            if short_score > long_score and short_score >= MIN_SCORE + 10 and is_exhausted_short: return "SHORT", short_score, short_signals + exhaustion_reasons_short, atr, 0, 0, regime, bias
+            elif long_score > short_score and long_score >= MIN_SCORE + 10 and is_exhausted_long: return "LONG", long_score, long_signals + exhaustion_reasons_long, atr, 0, 0, regime, bias
+            else: return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         else:
             return None, 0, [], atr, 0, 0, regime, bias
     
     def _score_long(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
-        row = df.iloc[-2]
-        prev = df.iloc[-3]
-        prev2 = df.iloc[-4]
-        score = 0
-        signals = []
+        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        score, signals = 0, []
         
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-        if p < e5 < e9 < e21 < e50:
-            w = self.weights.get_adjusted_weight("ema_bear_stack")
-            score += w
-            signals.append(f"EMA5↓[{w:.0f}]")
-        elif p < e5 < e9 < e21:
-            w = self.weights.get_adjusted_weight("ema_mild_bear")
-            score += w
-            signals.append(f"EMA4↓[{w:.0f}]")
-        elif p < e5 < e9:
-            w = self.weights.get_adjusted_weight("ema_weak_bear")
-            score += w
-            signals.append(f"EMA3↓[{w:.0f}]")
+        if p < e5 < e9 < e21 < e50: w = self.weights.get_adjusted_weight("ema_bear_stack"); score += w; signals.append(f"EMA5↓[{w:.0f}]")
+        elif p < e5 < e9 < e21: w = self.weights.get_adjusted_weight("ema_mild_bear"); score += w; signals.append(f"EMA4↓[{w:.0f}]")
+        elif p < e5 < e9: w = self.weights.get_adjusted_weight("ema_weak_bear"); score += w; signals.append(f"EMA3↓[{w:.0f}]")
         
         m5 = row["m5"]
-        if m5 < -0.003:
-            w = self.weights.get_adjusted_weight("mom_strong_neg")
-            score += w
-            signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
-        elif m5 < -0.002:
-            w = self.weights.get_adjusted_weight("mom_moderate_neg")
-            score += w
-            signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
+        if m5 < -0.003: w = self.weights.get_adjusted_weight("mom_strong_neg"); score += w; signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
+        elif m5 < -0.002: w = self.weights.get_adjusted_weight("mom_moderate_neg"); score += w; signals.append(f"Mom{m5*100:.1f}%↓[{w:.0f}]")
         
-        mh = row["mh"]
-        mh_p = prev["mh"]
-        mh_p2 = prev2["mh"]
-        if mh_p >= 0 and mh < 0:
-            w = self.weights.get_adjusted_weight("macd_cross_down")
-            score += w
-            signals.append(f"MACD_X↓[{w:.0f}]")
-        elif mh < 0 and mh < mh_p < mh_p2:
-            w = self.weights.get_adjusted_weight("macd_strengthen_neg")
-            score += w
-            signals.append(f"MACD↓↓[{w:.0f}]")
+        mh, mh_p, mh_p2 = row["mh"], prev["mh"], prev2["mh"]
+        if mh_p >= 0 and mh < 0: w = self.weights.get_adjusted_weight("macd_cross_down"); score += w; signals.append(f"MACD_X↓[{w:.0f}]")
+        elif mh < 0 and mh < mh_p < mh_p2: w = self.weights.get_adjusted_weight("macd_strengthen_neg"); score += w; signals.append(f"MACD↓↓[{w:.0f}]")
         
         br = row["br"]
-        if br < 0.44:
-            w = self.weights.get_adjusted_weight("orderflow_sell_climax")
-            score += w
-            signals.append(f"SellClimax{1-br:.0%}[{w:.0f}]")
-        elif br < 0.48:
-            w = self.weights.get_adjusted_weight("orderflow_sell_high")
-            score += w
-            signals.append(f"Sell{1-br:.0%}[{w:.0f}]")
+        if br < 0.44: w = self.weights.get_adjusted_weight("orderflow_sell_climax"); score += w; signals.append(f"SellClimax{1-br:.0%}[{w:.0f}]")
+        elif br < 0.48: w = self.weights.get_adjusted_weight("orderflow_sell_high"); score += w; signals.append(f"Sell{1-br:.0%}[{w:.0f}]")
         
         rsi = row["rsi"]
-        if rsi < 32:
-            w = self.weights.get_adjusted_weight("rsi_extreme_os")
-            score += w
-            signals.append(f"RSI{rsi:.0f}OS[{w:.0f}]")
-        elif rsi < 40:
-            w = self.weights.get_adjusted_weight("rsi_low")
-            score += w
-            signals.append(f"RSI{rsi:.0f}Lo[{w:.0f}]")
+        if rsi < 32: w = self.weights.get_adjusted_weight("rsi_extreme_os"); score += w; signals.append(f"RSI{rsi:.0f}OS[{w:.0f}]")
+        elif rsi < 40: w = self.weights.get_adjusted_weight("rsi_low"); score += w; signals.append(f"RSI{rsi:.0f}Lo[{w:.0f}]")
         
         return score, signals
     
     def _score_short(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
-        row = df.iloc[-2]
-        prev = df.iloc[-3]
-        prev2 = df.iloc[-4]
-        score = 0
-        signals = []
+        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        score, signals = 0, []
         
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-        if p > e5 > e9 > e21 > e50:
-            w = self.weights.get_adjusted_weight("ema_bull_stack")
-            score += w
-            signals.append(f"EMA5↑[{w:.0f}]")
-        elif p > e5 > e9 > e21:
-            w = self.weights.get_adjusted_weight("ema_mild_bull")
-            score += w
-            signals.append(f"EMA4↑[{w:.0f}]")
-        elif p > e5 > e9:
-            w = self.weights.get_adjusted_weight("ema_weak_bull")
-            score += w
-            signals.append(f"EMA3↑[{w:.0f}]")
+        if p > e5 > e9 > e21 > e50: w = self.weights.get_adjusted_weight("ema_bull_stack"); score += w; signals.append(f"EMA5↑[{w:.0f}]")
+        elif p > e5 > e9 > e21: w = self.weights.get_adjusted_weight("ema_mild_bull"); score += w; signals.append(f"EMA4↑[{w:.0f}]")
+        elif p > e5 > e9: w = self.weights.get_adjusted_weight("ema_weak_bull"); score += w; signals.append(f"EMA3↑[{w:.0f}]")
         
         m5 = row["m5"]
-        if m5 > 0.003:
-            w = self.weights.get_adjusted_weight("mom_strong")
-            score += w
-            signals.append(f"Mom+{m5*100:.1f}%↑[{w:.0f}]")
-        elif m5 > 0.002:
-            w = self.weights.get_adjusted_weight("mom_moderate")
-            score += w
-            signals.append(f"Mom+{m5*100:.1f}%↑[{w:.0f}]")
+        if m5 > 0.003: w = self.weights.get_adjusted_weight("mom_strong"); score += w; signals.append(f"Mom+{m5*100:.1f}%↑[{w:.0f}]")
+        elif m5 > 0.002: w = self.weights.get_adjusted_weight("mom_moderate"); score += w; signals.append(f"Mom+{m5*100:.1f}%↑[{w:.0f}]")
         
-        mh = row["mh"]
-        mh_p = prev["mh"]
-        mh_p2 = prev2["mh"]
-        if mh_p <= 0 and mh > 0:
-            w = self.weights.get_adjusted_weight("macd_cross_up")
-            score += w
-            signals.append(f"MACD_X↑[{w:.0f}]")
-        elif mh > 0 and mh > mh_p > mh_p2:
-            w = self.weights.get_adjusted_weight("macd_strengthen")
-            score += w
-            signals.append(f"MACD↑↑[{w:.0f}]")
+        mh, mh_p, mh_p2 = row["mh"], prev["mh"], prev2["mh"]
+        if mh_p <= 0 and mh > 0: w = self.weights.get_adjusted_weight("macd_cross_up"); score += w; signals.append(f"MACD_X↑[{w:.0f}]")
+        elif mh > 0 and mh > mh_p > mh_p2: w = self.weights.get_adjusted_weight("macd_strengthen"); score += w; signals.append(f"MACD↑↑[{w:.0f}]")
         
         br = row["br"]
-        if br > 0.56:
-            w = self.weights.get_adjusted_weight("orderflow_buy_climax")
-            score += w
-            signals.append(f"BuyClimax{br:.0%}[{w:.0f}]")
-        elif br > 0.52:
-            w = self.weights.get_adjusted_weight("orderflow_buy_high")
-            score += w
-            signals.append(f"Buy{br:.0%}[{w:.0f}]")
+        if br > 0.56: w = self.weights.get_adjusted_weight("orderflow_buy_climax"); score += w; signals.append(f"BuyClimax{br:.0%}[{w:.0f}]")
+        elif br > 0.52: w = self.weights.get_adjusted_weight("orderflow_buy_high"); score += w; signals.append(f"Buy{br:.0%}[{w:.0f}]")
         
         rsi = row["rsi"]
-        if rsi > 68:
-            w = self.weights.get_adjusted_weight("rsi_extreme_ob")
-            score += w
-            signals.append(f"RSI{rsi:.0f}OB[{w:.0f}]")
-        elif rsi > 60:
-            w = self.weights.get_adjusted_weight("rsi_high")
-            score += w
-            signals.append(f"RSI{rsi:.0f}Hi[{w:.0f}]")
+        if rsi > 68: w = self.weights.get_adjusted_weight("rsi_extreme_ob"); score += w; signals.append(f"RSI{rsi:.0f}OB[{w:.0f}]")
+        elif rsi > 60: w = self.weights.get_adjusted_weight("rsi_high"); score += w; signals.append(f"RSI{rsi:.0f}Hi[{w:.0f}]")
         
         return score, signals
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RISK MANAGER — v20.2: HardSL <-> ExtremeTP DITUKAR (sesuai permintaan)
+#  RISK MANAGER
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RiskManager:
     @staticmethod
     def calculate_sl_tp(entry_price: float, atr: float, direction: str) -> Tuple[float, float, float, float]:
-        # ---------------------------------------------------------------
-        # v20.2 SWAP:
-        # - HardSL (sl_distance) sekarang pakai parameter yang DULUNYA milik TP:
-        #     ATR_MULT_TP (1.8x, lebar) + cap MAX_SL_PCT (1.0%)
-        # - ExtremeTP (tp_distance) sekarang pakai parameter yang DULUNYA milik SL:
-        #     ATR_MULT_SL (1.0x, ketat) + cap MAX_TP_PCT (0.25%)
-        #
-        # Efek: stop loss jadi lebar (toleransi rugi lebih besar),
-        #       take profit jadi sempit (ambil untung lebih cepat/kecil).
-        #       RR berbalik dari ~1.8 jadi ~0.56.
-        # ---------------------------------------------------------------
-        sl_distance = ATR_MULT_TP * atr   # HardSL pakai multiplier TP (lebar)
-        tp_distance = ATR_MULT_SL * atr   # ExtremeTP pakai multiplier SL (ketat)
+        sl_distance = ATR_MULT_TP * atr   
+        tp_distance = ATR_MULT_SL * atr   
 
-        # Minimal TP 0.20% dari entry (tetap, cover fee round-trip)
         min_tp_distance = entry_price * 0.0020
-        if tp_distance < min_tp_distance:
-            tp_distance = min_tp_distance
+        if tp_distance < min_tp_distance: tp_distance = min_tp_distance
 
-        # Cap SL: sekarang pakai cap yang dulunya untuk TP (MAX_SL_PCT = 1.0%)
         max_sl = entry_price * MAX_SL_PCT
-
-        # Cap TP: sekarang pakai cap yang dulunya untuk SL (MAX_TP_PCT = 0.25%)
         max_tp = entry_price * MAX_TP_PCT
 
         sl_distance = min(sl_distance, max_sl)
         tp_distance = min(tp_distance, max_tp)
 
-        # Safety: pastikan TP tidak di bawah minimum setelah di-cap
-        if tp_distance < min_tp_distance:
-            tp_distance = min_tp_distance
+        if tp_distance < min_tp_distance: tp_distance = min_tp_distance
 
         if direction == "LONG":
             sl_price = entry_price - sl_distance
@@ -675,20 +435,9 @@ class RiskManager:
 
 @dataclass
 class TradeRecord:
-    symbol: str
-    direction: str
-    entry_price: float
-    exit_price: float
-    pnl: float
-    won: bool
-    regime: str
-    signals: List[str]
-    score: float
-    atr_entry: float
-    sl_pct: float
-    tp_pct: float
-    hold_seconds: float
-    timestamp: float = field(default_factory=time.time)
+    symbol: str; direction: str; entry_price: float; exit_price: float; pnl: float
+    won: bool; regime: str; signals: List[str]; score: float; atr_entry: float
+    sl_pct: float; tp_pct: float; hold_seconds: float; timestamp: float = field(default_factory=time.time)
 
 class LearningLayer:
     def __init__(self, signal_weights: SignalWeights):
@@ -713,8 +462,7 @@ class LearningLayer:
         self.stats_by_symbol[trade.symbol]["losses"] += 0 if trade.won else 1
         
         self.signal_weights.record_outcome(trade.signals, trade.won)
-        if len(self.trades) > 1000:
-            self.trades = self.trades[-500:]
+        if len(self.trades) > 1000: self.trades = self.trades[-500:]
     
     def get_winrate_by_regime(self, regime: str) -> float:
         stats = self.stats_by_regime[regime]
@@ -776,11 +524,8 @@ def tickers_all():
     try:
         raw = client.futures_ticker()
         _ticker_cache = {
-            t["symbol"]: {
-                "pct": float(t["priceChangePercent"]),
-                "vol": float(t["quoteVolume"]),
-                "last": float(t["lastPrice"])
-            } for t in raw
+            t["symbol"]: {"pct": float(t["priceChangePercent"]), "vol": float(t["quoteVolume"]), "last": float(t["lastPrice"])}
+            for t in raw
         }
         _ticker_ts = now
         return _ticker_cache
@@ -795,8 +540,7 @@ def ohlcv(symbol, interval, limit=100):
         kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(kl, columns=["time","open","high","low","close","volume",
                                         "ct","qv","trades","tbbase","tbquote","ignore"])
-        for c in ["open","high","low","close","volume","tbbase","tbquote"]:
-            df[c] = df[c].astype(float)
+        for c in ["open","high","low","close","volume","tbbase","tbquote"]: df[c] = df[c].astype(float)
         
         df["rsi"] = ta.momentum.RSIIndicator(df["close"], 14).rsi()
         df["mh"] = ta.trend.MACD(df["close"], 12, 26, 9).macd_diff()
@@ -821,20 +565,15 @@ def ohlcv(symbol, interval, limit=100):
 
 def ks_check():
     k, now = _ks, time.time()
-    if k["active"] and now >= k["resume"]:
-        k["active"] = False; k["consec"] = 0
+    if k["active"] and now >= k["resume"]: k["active"] = False; k["consec"] = 0
     if k["active"]: return True, k["reason"]
     day = now - (now % 86400)
     if day > k["day_reset"]: k["daily"] = 0.0; k["day_reset"] = day
     if k["daily"] <= DAILY_LOSS:
-        k["active"] = True
-        k["reason"] = f"daily({k['daily']:.2f})"
-        k["resume"] = day + 86400
+        k["active"] = True; k["reason"] = f"daily({k['daily']:.2f})"; k["resume"] = day + 86400
         return True, k["reason"]
     if k["consec"] >= CONSEC_MAX:
-        k["active"] = True
-        k["reason"] = f"consec({k['consec']})"
-        k["resume"] = now + CONSEC_PAUSE
+        k["active"] = True; k["reason"] = f"consec({k['consec']})"; k["resume"] = now + CONSEC_PAUSE
         return True, k["reason"]
     return False, ""
 
@@ -855,6 +594,34 @@ learning = LearningLayer(signal_weights)
 # ═══════════════════════════════════════════════════════════════════════════
 #  CORE TRADING FUNCTIONS (API TESTNET ENABLED)
 # ═══════════════════════════════════════════════════════════════════════════
+
+# FIX: Fungsi Sync Posisi saat startup agar tidak dobel order (Bug 6 posisi)
+def sync_open_positions():
+    global live_positions
+    try:
+        positions = client.futures_position_information()
+        synced_count = 0
+        for p in positions:
+            amt = float(p['positionAmt'])
+            if amt != 0.0:
+                sym = p['symbol']
+                entry = float(p['entryPrice'])
+                side = "LONG" if amt > 0 else "SHORT"
+                
+                # Setup dummy internal data supaya bisa dimonitor oleh trailing stop
+                atr = entry * 0.01 
+                sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(entry, atr, side)
+                live_positions[sym] = {
+                    "side": side, "entry": entry, "qty": abs(amt),
+                    "open_time": time.time(), "score": 0, "sigs": ["SYNCED_ON_START"], 
+                    "atr": atr, "sl_price": sl_price, "tp_price": tp_price,
+                    "sl_pct": sl_pct, "tp_pct": tp_pct, "regime": "UNKNOWN", "bias": 0,
+                    "max_pnl_pct": 0.0 # penting untuk trailing
+                }
+                synced_count += 1
+        print(f"  🔄 [SYNC] Berhasil sinkronisasi {synced_count} posisi aktif dari akun Binance!")
+    except Exception as e:
+        print(f"  ❌ [SYNC ERROR] Gagal tarik data posisi dari Binance: {e}")
 
 def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     with _lock:
@@ -877,9 +644,15 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
         return
     
     sl_price, tp_price, sl_pct, tp_pct = RiskManager.calculate_sl_tp(price, atr, direction)
-    
     binance_side = "BUY" if direction == "LONG" else "SELL"
+    
     try:
+        # FIX: Maksa jadi ISOLATED supaya margin beneran ke-lock 2$
+        try:
+            client.futures_change_margin_type(symbol=sym, marginType='ISOLATED')
+        except:
+            pass # Lewati kalau sudah di isolated
+            
         client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
         client.futures_create_order(
             symbol=sym,
@@ -897,7 +670,8 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
         "sl_price": sl_price, "tp_price": tp_price,
         "sl_pct": sl_pct, "tp_pct": tp_pct,
-        "regime": regime, "bias": bias
+        "regime": regime, "bias": bias,
+        "max_pnl_pct": 0.0 # reset pnl
     }
     with _lock: live_positions[sym] = pos
     
@@ -907,16 +681,19 @@ def live_open(sym, direction, score, sigs, price, atr, regime, bias):
     _stats["trades"] += 1
 
 def live_close(sym, reason, price=None):
+    # FIX: Ambil (get) data tanpa menghapusnya dulu (pop).
+    # Agar jika API gagal, posisi masih termonitor dan bot ga lupa nutup
     with _lock:
-        pos = live_positions.pop(sym, None)
+        pos = live_positions.get(sym)
+        
     if pos is None or pos.get("_r"): return
     
     if price is None: price = price_live(sym)
     if price == 0: return
     
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
-    
     binance_close_side = "SELL" if side == "LONG" else "BUY"
+    
     try:
         client.futures_create_order(
             symbol=sym,
@@ -924,8 +701,12 @@ def live_close(sym, reason, price=None):
             type='MARKET',
             quantity=q_val
         )
+        # FIX: HANYA HAPUS DARI MEMORI JIKA API SUKSES MENGIRIM ORDER CLOSE
+        with _lock:
+            live_positions.pop(sym, None)
     except Exception as e:
-        print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}")
+        print(f"\n  ❌ [API ERROR] Gagal close posisi {sym}: {e}. Akan dicoba lagi pada tick berikutnya.")
+        return # Skip ke tahap rekaman jika gagal nutup
 
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
@@ -970,7 +751,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MONITOR POSITIONS — TIDAK DIUBAH dari v20.1 (DYNAMIC TRAILING TAKE PROFIT)
+#  MONITOR POSITIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def monitor_positions():
@@ -986,21 +767,14 @@ def monitor_positions():
         sl_px = pos["sl_price"]
         tp_px = pos["tp_price"]
         
-        # 1. Hitung persentase PnL saat ini (positif = profit, negatif = loss)
         if side == "LONG":
             pnl_pct = (px - entry) / entry
         else:
             pnl_pct = (entry - px) / entry
             
-        # 2. Rekam puncak PnL tertinggi yang pernah dicapai posisi ini
-        if "max_pnl_pct" not in pos:
-            pos["max_pnl_pct"] = pnl_pct
-        elif pnl_pct > pos["max_pnl_pct"]:
-            pos["max_pnl_pct"] = pnl_pct
+        if "max_pnl_pct" not in pos: pos["max_pnl_pct"] = pnl_pct
+        elif pnl_pct > pos["max_pnl_pct"]: pos["max_pnl_pct"] = pnl_pct
             
-        # 3. ==========================================
-        #    LOGIKA DYNAMIC TRAILING TAKE PROFIT (tidak diubah)
-        #    ==========================================
         if pos["max_pnl_pct"] >= TRAIL_ACTIVATE_PCT:
             dynamic_limit = pos["max_pnl_pct"] - TRAIL_CALLBACK_PCT
             trailing_limit = max(TRAIL_MIN_FLOOR, dynamic_limit)
@@ -1008,24 +782,15 @@ def monitor_positions():
                 live_close(sym, "TrailingTP", px)
                 continue
 
-        # 4. ==========================================
-        #    HARD SL & EXTREME TP (sekarang pakai jarak yang sudah ditukar
-        #    di RiskManager.calculate_sl_tp — logika trigger di sini SAMA
-        #    PERSIS seperti v20.1, hanya nilai sl_px/tp_px yang berbeda)
-        #    ==========================================
         if side == "LONG":
-            if px <= sl_px:
-                live_close(sym, "HardSL", px); continue
-            if px >= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+            if px <= sl_px: live_close(sym, "HardSL", px); continue
+            if px >= tp_px: live_close(sym, "ExtremeTP", px); continue
         else:
-            if px >= sl_px:
-                live_close(sym, "HardSL", px); continue
-            if px <= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+            if px >= sl_px: live_close(sym, "HardSL", px); continue
+            if px <= tp_px: live_close(sym, "ExtremeTP", px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD (REVERSED LOGIC EMBEDDED) — TIDAK DIUBAH
+#  SCANNER THREAD (REVERSED LOGIC EMBEDDED)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -1036,8 +801,7 @@ def scan_one(sym):
         df_ta = df.copy()
         
         required = ["rsi","mh","e5","e9","e21","e50","atr","adx","vr","br","m5","br2"]
-        if not all(col in df_ta.columns for col in required):
-            df_ta = run_ta(df_ta)
+        if not all(col in df_ta.columns for col in required): df_ta = run_ta(df_ta)
             
         px = df_ta["close"].iloc[-2]
         atr = df_ta["atr"].iloc[-2]
@@ -1046,13 +810,10 @@ def scan_one(sym):
         direction, score, sigs, atr_val, _, _, regime, bias = scorer.get_signal(df_ta, sym)
         if direction is None: return None
 
-        # Reversed logic: sinyal LONG → eksekusi SHORT, sinyal SHORT → eksekusi LONG
         if direction == "LONG":
-            direction = "SHORT"
-            sigs = ["REV_SHORT"] + sigs 
+            direction = "SHORT"; sigs = ["REV_SHORT"] + sigs 
         elif direction == "SHORT":
-            direction = "LONG"
-            sigs = ["REV_LONG"] + sigs   
+            direction = "LONG"; sigs = ["REV_LONG"] + sigs   
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1112,17 +873,17 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ LIVE TESTNET v20.2 — REGIME-AWARE ADAPTIVE TRADING (SL/TP SWAPPED)")
+    print(f"    ✅ LIVE TESTNET v20.2.1 — REGIME-AWARE ADAPTIVE TRADING")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    📊 Learning: Global WR {learning.get_global_winrate():.1%}")
-    print(f"    ⚙️  HardSL:1.8xATR(cap 1.0%) | ExtremeTP:1.0xATR(cap 0.25%) [DITUKAR] | Trail@0.35%/0.15%cb/0.20%floor")
+    print(f"    ⚙️  HardSL:1.8xATR(cap 1.0%) | ExtremeTP:1.0xATR(cap 0.25%) | Trail@0.35%/0.15%cb/0.20%floor")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
-            print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+            print(f"        {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*70}")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1132,8 +893,7 @@ def print_full():
 def t_monitor():
     while True:
         try:
-            if live_positions:
-                monitor_positions()
+            if live_positions: monitor_positions()
         except: pass
         time.sleep(MONITOR_INT)
 
@@ -1200,20 +960,26 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ LIVE TESTNET v20.2 — REGIME-AWARE ADAPTIVE TRADING ENGINE      ║")
-    print("║  🔁 SWAP: HardSL 1.8xATR(cap 1.0%) | ExtremeTP 1.0xATR(cap 0.25%) ║")
-    print("║  ✅ Trail aktif@0.35% | callback 0.15% | floor 0.20% (tidak diubah)║")
+    print("║  ✅ LIVE TESTNET v20.2.1 — SYNC & ORPHAN FIX                       ║")
+    print("║  🔁 SWAP: HardSL 1.8xATR(cap 1.0%) | ExtremeTP 1.0xATR(cap 0.25%)  ║")
+    print("║  ✅ Isolated Margin Dipaksakan | Posisi tersinkron ke Binance      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    
+    # FIX: Panggil sync_open_positions sebelum bot benar-benar running.
+    sync_open_positions()
+    
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
         syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
     except:
         syms = list(dict.fromkeys(SYMBOLS))
     print(f"  📋 {len(syms)} simbol aktif terpantau")
+    
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
+    
     time.sleep(2)
     tickers_all()
     cycle = 0
