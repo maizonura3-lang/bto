@@ -1,9 +1,10 @@
 """
-Bot Scalping v21.1 — ANTI-LOOP & MARGIN PROTECTION
+Bot Scalping v21.1 — ANTI-LOOP & MARGIN PROTECTION (FIXED)
 ====================================================
 - Menambahkan workingType="CONTRACT_PRICE" untuk menghindari error -2021
 - Menambahkan Emergency Close jika bracket order gagal dipasang
 - Strict Risk: SL 0.4% dan TP 0.3%
+- FIXED: Mengembalikan global state variabel yang hilang
 """
 
 import os
@@ -333,6 +334,14 @@ _hot_syms = deque(maxlen=30)
 _macro = {"btc": "UNKNOWN"}
 _ks = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "extreme_tp": 0, "hard_sl": 0, "active_binance_positions": 0, "hist": deque(maxlen=200), "start": time.time()}
+
+# --- INI VARIABEL YANG SEMPAT HILANG ---
+live_positions = {}
+trade_log = []
+signal_weights = SignalWeights()
+scorer = SignalScorer(signal_weights)
+learning = LearningLayer(signal_weights)
+# ---------------------------------------
 
 def get_qty_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
@@ -710,7 +719,7 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ REVERSED LOGIC v21.1 — ANTI-LOOP & MARGIN PROTECTION           ║")
+    print("║  ✅ REVERSED LOGIC v21.1 — ANTI-LOOP & MARGIN PROTECTION (FIXED)   ║")
     print("║  ✅ Strict 0.4% SL | 0.3% TP | No Slippage | CONTRACT_PRICE Sync   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
