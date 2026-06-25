@@ -1,10 +1,9 @@
 """
-Bot Scalping v21.1 — ANTI-LOOP & MARGIN PROTECTION (FIXED)
+Bot Scalping v22.0 — FLIPPED LOGIC & REVERSED RR
 ====================================================
-- Menambahkan workingType="CONTRACT_PRICE" untuk menghindari error -2021
-- Menambahkan Emergency Close jika bracket order gagal dipasang
-- Strict Risk: SL 0.4% dan TP 0.3%
-- FIXED: Mengembalikan global state variabel yang hilang
+- Arah Entry diputar balik (kembali ke Normal: Long = Long)
+- SL dan TP ditukar (SL 0.3% / TP 0.4%)
+- Tetap menggunakan Server-Side Bracket Orders (Anti-Jebol)
 """
 
 import os
@@ -34,9 +33,9 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# Strict Risk Management
-SL_PCT = 0.004  
-TP_PCT = 0.003  
+# RR DITUKAR (SL jadi lebih sempit, TP jadi lebih lebar)
+SL_PCT = 0.003  # SL 0.3%
+TP_PCT = 0.004  # TP 0.4%
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS 
@@ -335,13 +334,11 @@ _macro = {"btc": "UNKNOWN"}
 _ks = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "extreme_tp": 0, "hard_sl": 0, "active_binance_positions": 0, "hist": deque(maxlen=200), "start": time.time()}
 
-# --- INI VARIABEL YANG SEMPAT HILANG ---
 live_positions = {}
 trade_log = []
 signal_weights = SignalWeights()
 scorer = SignalScorer(signal_weights)
 learning = LearningLayer(signal_weights)
-# ---------------------------------------
 
 def get_qty_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
@@ -449,7 +446,9 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
     
-    actual_side = "SHORT" if orig_direction == "LONG" else "LONG"
+    # DIKEMBALIKAN KE ARAH NORMAL (Sesuai sinyal Indikator)
+    actual_side = orig_direction 
+    
     sl_dist = price * SL_PCT
     tp_dist = price * TP_PCT
     
@@ -473,7 +472,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         # 1. BUKA POSISI MARKET
         client.futures_create_order(symbol=sym, side=api_side, type="MARKET", quantity=q_val)
         
-        # 2. SET STOP LOSS (Pakai CONTRACT_PRICE untuk menghindari Error -2021)
+        # 2. SET STOP LOSS 
         client.futures_create_order(
             symbol=sym, side=close_side, type="STOP_MARKET", 
             stopPrice=sl_price, closePosition="true", workingType="CONTRACT_PRICE"
@@ -487,7 +486,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         
     except Exception as e:
         print(f"API Error (Open {sym}): {e}")
-        # EMERGENCY CLOSE: Cegah bocor margin kalau gagal pasang bracket
         try:
             client.futures_cancel_all_open_orders(symbol=sym)
             pos_info = client.futures_position_information(symbol=sym)
@@ -510,7 +508,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [REVERSED] {sym} {actual_side} @{price:.6g} | Strict SL:{SL_PCT*100:.1f}% TP:{TP_PCT*100:.1f}%")
+    print(f"\n  {d} [FLIPPED-RR] {sym} {actual_side} @{price:.6g} | Strict SL:{SL_PCT*100:.1f}% TP:{TP_PCT*100:.1f}%")
     _stats["trades"] += 1
     _stats["active_binance_positions"] += 1
 
@@ -524,7 +522,7 @@ def process_closed_position(sym, pos_data, reason, current_price):
     won = pnl >= 0
     e = "🟢" if won else "🔴"
     
-    print(f"  {e} [REVERSED] {sym} {side} CLOSED by {reason}")
+    print(f"  {e} [FLIPPED-RR] {sym} {side} CLOSED by {reason}")
     print(f"     {entry:.6g}→{current_price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | Net PnL:{pnl:+.5f}U")
     
     trade = TradeRecord(
@@ -635,7 +633,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v21.1 FIXED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v22.0 FLIPPED-RR] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -646,7 +644,7 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ SERVER-SIDE SL/TP v21.1 — PROTECTED MARGIN (0.4% SL / 0.3% TP)")
+    print(f"    ✅ SERVER-SIDE v22.0 — FLIPPED RR (0.3% SL / 0.4% TP)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     if trade_log:
@@ -719,8 +717,8 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ REVERSED LOGIC v21.1 — ANTI-LOOP & MARGIN PROTECTION (FIXED)   ║")
-    print("║  ✅ Strict 0.4% SL | 0.3% TP | No Slippage | CONTRACT_PRICE Sync   ║")
+    print("║  ✅ NORMAL DIRECTION v22.0 — FLIPPED RR (0.3% SL / 0.4% TP)        ║")
+    print("║  ✅ Logika berlawanan dari v21.1 | Anti-Loop | Protected Margin    ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
