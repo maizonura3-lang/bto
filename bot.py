@@ -1,8 +1,8 @@
 """
-Bot Scalping v23.0 — REVERSED LOGIC & SWAPPED RR
+Bot Scalping v23.0 — THE REVENGE (CONTRARIAN LOGIC)
 ====================================================
-- Arah Entry diputar balik (Long = Short, Short = Long)
-- SL dan TP ditukar (SL 0.4% / TP 0.3%)
+- Arah Entry diputar balik 180 derajat (Indikator LONG = Bot SHORT)
+- SL dan TP ditukar kembali (SL 0.4% / TP 0.3%)
 - Tetap menggunakan Server-Side Bracket Orders (Anti-Jebol)
 """
 
@@ -33,7 +33,7 @@ LEVERAGE = 20
 ORDER_USDT = 2.0
 MAX_POSITIONS = 3
 
-# RR DITUKAR (SL lebih lebar, TP lebih sempit biar cepat hit)
+# RR DITUKAR (TP dibikin lebih cepat hit, SL diberi ruang napas)
 SL_PCT = 0.004  # SL 0.4%
 TP_PCT = 0.003  # TP 0.3%
 
@@ -446,7 +446,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
     
-    # DIBALIK LAGI KE REVERSED (Indikator Long -> Bot Short)
+    # DIBALIK KEMBALI 180 DERAJAT (CONTRARIAN LOGIC)
+    # Jika indikator mendeteksi peluang LONG, bot otomatis pasang SHORT (dan sebaliknya)
     actual_side = "SHORT" if orig_direction == "LONG" else "LONG"
     
     sl_dist = price * SL_PCT
@@ -508,7 +509,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
     with _lock: live_positions[sym] = pos
     
     d = "🟢" if actual_side == "LONG" else "🔴"
-    print(f"\n  {d} [REVERSED] {sym} {actual_side} @{price:.6g} | Strict SL:{SL_PCT*100:.1f}% TP:{TP_PCT*100:.1f}%")
+    print(f"\n  {d} [v23.0 CONTRARIAN] {sym} {actual_side} @{price:.6g} | Strict SL:{SL_PCT*100:.1f}% TP:{TP_PCT*100:.1f}%")
     _stats["trades"] += 1
     _stats["active_binance_positions"] += 1
 
@@ -522,7 +523,7 @@ def process_closed_position(sym, pos_data, reason, current_price):
     won = pnl >= 0
     e = "🟢" if won else "🔴"
     
-    print(f"  {e} [REVERSED] {sym} {side} CLOSED by {reason}")
+    print(f"  {e} [v23.0 CONTRARIAN] {sym} {side} CLOSED by {reason}")
     print(f"     {entry:.6g}→{current_price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | Net PnL:{pnl:+.5f}U")
     
     trade = TradeRecord(
@@ -633,7 +634,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v23.0 REVERSED] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v23.0 CONTRARIAN] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ TP:{_stats['extreme_tp']} SL:{_stats['hard_sl']} | Regime WR: {learning.get_winrate_by_regime('TRENDING_BULL'):.0%}")
 
 def print_full():
@@ -644,7 +645,7 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*70}")
-    print(f"    ✅ SERVER-SIDE v23.0 — SWAPPED RR (0.4% SL / 0.3% TP)")
+    print(f"    ✅ SERVER-SIDE v23.0 — CONTRARIAN LOGIC (0.4% SL / 0.3% TP)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     if trade_log:
@@ -717,8 +718,8 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ REVERSED DIRECTION v23.0 — SWAPPED RR (0.4% SL / 0.3% TP)      ║")
-    print("║  ✅ Arah berlawanan indikator | SL Lebar (0.4%) TP Sempit (0.3%)   ║")
+    print("║  ✅ CONTRARIAN v23.0 — REVERSED DIRECTION & SWAPPED RR             ║")
+    print("║  ✅ Balas dendam: Indikator menyuruh LONG, Bot eksekusi SHORT      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
